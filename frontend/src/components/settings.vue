@@ -10,7 +10,9 @@ import {
   UpdateConfig,
   CheckSponsorCode,
   FetchAiModels,
-  FetchAiModelInfo
+  FetchAiModelInfo,
+  SendTestTelegramMessage,
+  TriggerTGDailyPush
 } from "../../wailsjs/go/main/App";
 import {NTag, NTooltip, NIcon, useMessage} from "naive-ui";
 import {data, models} from "../../wailsjs/go/models";
@@ -28,6 +30,15 @@ const formValue = ref({
   dingPush: {
     enable: false,
     dingRobot: ''
+  },
+  tgPush: {
+    enable: false,
+    botToken: '',
+    chatId: '',
+    aiConfigId: 0,
+    sysPromptId: 0,
+    userPrompt: '',
+    useProxy: false
   },
   localPush: {
     enable: true,
@@ -206,6 +217,15 @@ onMounted(() => {
       enable: res.dingPushEnable,
       dingRobot: res.dingRobot
     }
+    formValue.value.tgPush = {
+      enable: !!res.tgPushEnable,
+      botToken: res.tgBotToken || '',
+      chatId: res.tgChatId || '',
+      aiConfigId: res.tgAiConfigId || 0,
+      sysPromptId: res.tgSysPromptId || 0,
+      userPrompt: res.tgUserPrompt || '',
+      useProxy: !!res.tgUseProxy
+    }
     formValue.value.localPush = {
       enable: res.localPushEnable,
     }
@@ -256,6 +276,13 @@ function saveConfig() {
     ID: formValue.value.ID,
     dingPushEnable: formValue.value.dingPush.enable,
     dingRobot: formValue.value.dingPush.dingRobot,
+    tgPushEnable: formValue.value.tgPush.enable,
+    tgBotToken: formValue.value.tgPush.botToken,
+    tgChatId: formValue.value.tgPush.chatId,
+    tgAiConfigId: formValue.value.tgPush.aiConfigId,
+    tgSysPromptId: formValue.value.tgPush.sysPromptId,
+    tgUserPrompt: formValue.value.tgPush.userPrompt,
+    tgUseProxy: formValue.value.tgPush.useProxy,
     localPushEnable: formValue.value.localPush.enable,
     updateBasicInfoOnStart: formValue.value.updateBasicInfoOnStart,
     refreshInterval: formValue.value.refreshInterval,
@@ -326,6 +353,43 @@ function sendTestNotice() {
   })
 }
 
+function sendTGTest() {
+  const token = (formValue.value.tgPush.botToken || '').trim()
+  const chatId = (formValue.value.tgPush.chatId || '').trim()
+  if (!token || !chatId) {
+    message.warning('请先填写 Bot Token 和 Chat ID')
+    return
+  }
+  const useProxy = !!formValue.value.tgPush.useProxy
+  message.loading('正在发送测试消息…', { duration: 0, key: 'tg-test' })
+  SendTestTelegramMessage(token, chatId, useProxy).then(res => {
+    message.destroyAll()
+    if (res && res.indexOf('成功') >= 0) {
+      message.success(res)
+    } else {
+      message.error(res || '发送失败')
+    }
+  }).catch(e => {
+    message.destroyAll()
+    message.error('发送异常: ' + e)
+  })
+}
+
+function triggerTGPushNow(mode) {
+  message.loading('正在触发推送（涉及 AI 调用，可能需要 1-2 分钟）…', { duration: 0, key: 'tg-trigger' })
+  TriggerTGDailyPush(mode).then(res => {
+    message.destroyAll()
+    if (res && res.indexOf('成功') >= 0) {
+      message.success(res)
+    } else {
+      message.warning(res || '推送失败')
+    }
+  }).catch(e => {
+    message.destroyAll()
+    message.error('触发异常: ' + e)
+  })
+}
+
 function exportConfig() {
   ExportConfig().then(res => {
     message.info(res)
@@ -348,6 +412,15 @@ function importConfig() {
       formValue.value.dingPush = {
         enable: config.dingPushEnable,
         dingRobot: config.dingRobot
+      }
+      formValue.value.tgPush = {
+        enable: !!config.tgPushEnable,
+        botToken: config.tgBotToken || '',
+        chatId: config.tgChatId || '',
+        aiConfigId: config.tgAiConfigId || 0,
+        sysPromptId: config.tgSysPromptId || 0,
+        userPrompt: config.tgUserPrompt || '',
+        useProxy: !!config.tgUseProxy
       }
       formValue.value.localPush = {
         enable: config.localPushEnable,
@@ -625,6 +698,60 @@ function deletePrompt(ID) {
               <n-input placeholder="请输入钉钉机器人接口地址" v-model:value="formValue.dingPush.dingRobot"/>
               <n-button type="primary" @click="sendTestNotice">发送测试通知</n-button>
             </n-form-item-gi>
+
+            <n-form-item-gi :span="3" label="TG 推送：" path="tgPush.enable">
+              <n-switch v-model:value="formValue.tgPush.enable"/>
+            </n-form-item-gi>
+
+            <n-gi v-if="formValue.tgPush.enable" :span="21">
+              <n-card size="small" :bordered="true" style="background-color: rgba(120, 180, 240, 0.05);">
+                <template #header>
+                  <n-text strong>Telegram 每日推送配置</n-text>
+                  <n-text depth="3" style="margin-left:12px; font-size:12px;">
+                    9:00 工作日发昨日 14:30 后的推荐对比最新价；14:30 工作日跑短线选股 AI + 涨停复盘后发当日推荐
+                  </n-text>
+                </template>
+                <n-grid :cols="24" :x-gap="16" :y-gap="8">
+                  <n-form-item-gi :span="12" label="Bot Token：" path="tgPush.botToken">
+                    <n-input placeholder="例如 8412143856:AAGTPD4iDpb5..." v-model:value="formValue.tgPush.botToken" type="password" show-password-on="click"/>
+                  </n-form-item-gi>
+                  <n-form-item-gi :span="6" label="Chat ID：" path="tgPush.chatId">
+                    <n-input placeholder="例如 8282495910" v-model:value="formValue.tgPush.chatId"/>
+                  </n-form-item-gi>
+                  <n-form-item-gi :span="6" label="走代理：" path="tgPush.useProxy">
+                    <n-switch v-model:value="formValue.tgPush.useProxy"/>
+                    <n-text depth="3" style="margin-left:8px; font-size:12px;">国内访问 api.telegram.org 通常需要</n-text>
+                  </n-form-item-gi>
+
+                  <n-form-item-gi :span="12" label="14:30 用的 AI 配置：" path="tgPush.aiConfigId">
+                    <n-select v-model:value="formValue.tgPush.aiConfigId"
+                              :options="formValue.openAI.aiConfigs.map((c, i) => ({label: c.name || ('AI 配置 #' + (i+1)), value: c.ID || c.id || 0}))"
+                              placeholder="留空用第一个"/>
+                  </n-form-item-gi>
+                  <n-form-item-gi :span="12" label="系统提示词（从你收藏的模板选）：" path="tgPush.sysPromptId">
+                    <n-select v-model:value="formValue.tgPush.sysPromptId"
+                              :options="promptTemplates.filter(p => p.type === '模型系统Prompt').map(p => ({label: p.name, value: p.ID || p.id}))"
+                              placeholder="选系统提示词（如：短线选股AI助手）" clearable filterable/>
+                  </n-form-item-gi>
+                  <n-form-item-gi :span="24" label="用户提问（自定义文本）：" path="tgPush.userPrompt">
+                    <n-input v-model:value="formValue.tgPush.userPrompt" type="textarea"
+                             placeholder="例如：根据今日的市场行情数据，帮我选出几只胜率高的股票推荐"
+                             :autosize="{ minRows: 2, maxRows: 6 }" show-count :maxlength="500"/>
+                  </n-form-item-gi>
+
+                  <n-gi :span="24">
+                    <n-space>
+                      <n-button type="primary" size="small" @click="sendTGTest">📨 发送测试消息</n-button>
+                      <n-button type="info" size="small" @click="triggerTGPushNow('morning')">🌅 立即触发盘前回顾</n-button>
+                      <n-button type="warning" size="small" @click="triggerTGPushNow('afternoon')">📊 立即触发盘中复盘</n-button>
+                    </n-space>
+                    <n-text depth="3" style="font-size: 11px; display:block; margin-top:6px;">
+                      提示：保存设置后才会被定时任务用到。立即触发会调用 AI，可能需要 1-2 分钟。
+                    </n-text>
+                  </n-gi>
+                </n-grid>
+              </n-card>
+            </n-gi>
 
           </n-grid>
         </n-card>

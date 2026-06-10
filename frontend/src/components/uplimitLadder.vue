@@ -1,6 +1,6 @@
 <script setup>
 import {onBeforeMount, onBeforeUnmount, ref, computed, h} from 'vue'
-import {GetConfig, GetUplimitHot, IsTradingTime, IsTradingDay, GetLatestTradingDay} from "../../wailsjs/go/main/App";
+import {GetConfig, GetUplimitHot, IsTradingTime, IsTradingDay, GetLatestTradingDay, AnalyzeUplimitWithAI, GetAiConfigs, GetUplimitAISummaries, GetUplimitAISummaryDetail, DeleteUplimitAISummary} from "../../wailsjs/go/main/App";
 import {NButton, NText, NTag, NTooltip, NProgress, useMessage} from "naive-ui";
 import StockLightweightKlineChart from "./StockLightweightKlineChart.vue";
 
@@ -298,6 +298,217 @@ const relayPlates = computed(() => {
   })
 })
 
+// =============== 今日复盘 - 聚合指标 ===============
+// 炸板率: 炸板数 / (涨停数 + 炸板数)
+const explodedRatio = computed(() => {
+  const zt = totalZtCount.value
+  const exp = explodedStocks.value.length
+  if (zt + exp === 0) return 0
+  return Math.round((exp / (zt + exp)) * 100)
+})
+
+// 市场温度判断
+const marketTemperature = computed(() => {
+  const max = maxCount.value
+  const zt = totalZtCount.value
+  const ratio = explodedRatio.value
+  // 综合判断：最高板 + 涨停数 + 炸板率
+  if (max >= 6 && zt >= 80 && ratio < 20) return { label: '极强', type: 'error', desc: '高度+广度+抱团三好，可激进' }
+  if (max >= 5 && zt >= 60) return { label: '强', type: 'error', desc: '主线明确，关注龙头' }
+  if (max >= 4 && zt >= 50) return { label: '中性偏强', type: 'warning', desc: '中度热度，跟随主线' }
+  if (max >= 3 && zt >= 30) return { label: '中性', type: 'warning', desc: '机会一般，控制仓位' }
+  if (ratio >= 40) return { label: '情绪降温', type: 'success', desc: '炸板率高，慎追高' }
+  return { label: '偏冷', type: 'success', desc: '观望为主' }
+})
+
+// 连板分布（4板/3板/2板/1板...）
+const ladderDistribution = computed(() => {
+  return banInfo.value.map(b => `${b.level}板(${b.count})`).join(' · ')
+})
+
+// 主线板块 TOP 3（带涨停数 + 炸板数 + 板块内炸板率）
+const mainPlates = computed(() => {
+  return plateList.value.slice(0, 3).map(p => {
+    const ztArr = rawData.value?.plate_stocks?.[p.code] || []
+    const zbArr = rawData.value?.plate_stocks_zb?.[p.code] || []
+    const total = ztArr.length + zbArr.length
+    const plateExpRatio = total === 0 ? 0 : Math.round((zbArr.length / total) * 100)
+    return {
+      ...p,
+      ztCount: ztArr.length,
+      zbCount: zbArr.length,
+      plateExplodedRatio: plateExpRatio,
+    }
+  })
+})
+
+// 龙头候选（综合 = 热度*0.6 + 连板天数*权重*0.4 + 主线匹配加分）
+const leaderCandidates = computed(() => {
+  if (!stocksHot.value.length) return []
+  const mainPlateCodes = new Set(mainPlates.value.map(p => p.code))
+  const mainPlateNames = new Set(mainPlates.value.map(p => p.name))
+
+  // 合并 stocksHot 热度 + 连板信息
+  const merged = stocksHot.value.slice(0, 30).map(h => {
+    const detail = stockDetailMap.value[h.code] || {}
+    const ktTimes = detail.up_limit_keep_times || 0
+    const inMain = h.plates.some(pName => mainPlateNames.has(pName))
+    // 综合分数：热度归一化 + 连板加成 + 主线加分
+    const hotNorm = stocksHot.value[0]?.score ? (h.score / stocksHot.value[0].score) * 60 : 0
+    const ladderScore = Math.min(ktTimes * 10, 40)
+    const mainBonus = inMain ? 15 : 0
+    const totalScore = Math.round(hotNorm + ladderScore + mainBonus)
+    return {
+      ...h,
+      ktTimes,
+      inMain,
+      totalScore,
+      fd_close: detail.fd_close || 0,
+      market_c: detail.market_c || '',
+      amount: detail.amount || '',
+    }
+  })
+  merged.sort((a, b) => b.totalScore - a.totalScore)
+  return merged.slice(0, 8)
+})
+
+// 前期连板今日炸板（重点警示）
+const dangerExploded = computed(() => {
+  return explodedStocks.value.filter(s => (s.up_limit_keep_times || 0) >= 2).slice(0, 5)
+})
+
+// =============== AI 深度复盘 ===============
+const aiAnalyzing = ref(false)
+const aiResult = ref(null) // {marketSentiment, summary, recommendations, savedCount, modelName, analyzeDate, analyzeTime}
+const aiResultModal = ref(false)
+const aiConfigs = ref([])
+const selectedAiConfigId = ref(0)
+
+const aiConfigOptions = computed(() => {
+  return aiConfigs.value.map(c => ({
+    label: c.name || c.modelName || `AI-${getCfgId(c)}`,
+    value: getCfgId(c), // 兼容大写/小写 id 字段
+  }))
+})
+
+function onSelectAiConfig(v) {
+  console.log('[AI 配置切换] 新值:', v, '类型:', typeof v)
+  selectedAiConfigId.value = v
+  const cfg = aiConfigs.value.find(c => getCfgId(c) === v)
+  message.success('已切换到: ' + (cfg?.name || cfg?.modelName || v))
+}
+
+// 进入复盘 tab 时加载 AI 配置列表
+// 兼容字段名（Go 大写 ID / 小写 id 都接住）
+function getCfgId(c) {
+  return c?.ID ?? c?.id ?? 0
+}
+
+async function loadAiConfigs() {
+  try {
+    const res = await GetAiConfigs()
+    aiConfigs.value = res || []
+    console.log('[AI 配置加载] 共', aiConfigs.value.length, '条:', aiConfigs.value)
+    // 优先选名字包含 claude 的
+    const claude = aiConfigs.value.find(c => /claude/i.test(c.name || '') || /claude/i.test(c.modelName || ''))
+    if (claude) selectedAiConfigId.value = getCfgId(claude)
+    else if (aiConfigs.value.length > 0) selectedAiConfigId.value = getCfgId(aiConfigs.value[0])
+    console.log('[AI 配置加载] 默认选中 ID:', selectedAiConfigId.value)
+  } catch (e) {
+    console.warn('加载 AI 配置失败', e)
+  }
+}
+
+// =============== 历史复盘列表 ===============
+const historySummaries = ref([])
+
+async function loadHistorySummaries() {
+  try {
+    const list = await GetUplimitAISummaries(20)
+    historySummaries.value = list || []
+  } catch (e) {
+    console.warn('加载历史复盘失败', e)
+  }
+}
+
+async function viewHistorySummary(id) {
+  try {
+    const result = await GetUplimitAISummaryDetail(id)
+    aiResult.value = result
+    aiResultModal.value = true
+  } catch (e) {
+    message.error('加载复盘详情失败: ' + (e?.message || e))
+  }
+}
+
+async function deleteHistorySummary(id) {
+  try {
+    await DeleteUplimitAISummary(id)
+    message.success('已删除')
+    loadHistorySummaries()
+  } catch (e) {
+    message.error('删除失败')
+  }
+}
+
+async function runAIAnalysis() {
+  if (aiAnalyzing.value) return
+  if (!selectedDate.value) {
+    message.warning('请先选择日期')
+    return
+  }
+  if (!aiConfigs.value.length) {
+    message.error('未配置任何 AI，请先在「设置 → AI 设置」中配置 Claude/LiteLLM')
+    return
+  }
+  aiAnalyzing.value = true
+  const loadingMsg = message.loading('🤖 AI 正在深度分析涨停梯队...（约 30-60 秒）', { duration: 0 })
+  try {
+    const result = await AnalyzeUplimitWithAI(selectedDate.value, selectedAiConfigId.value || 0)
+    loadingMsg.destroy()
+    aiResult.value = result
+    aiResultModal.value = true
+    message.success(`分析完成，已生成 ${result.savedCount} 条推荐入库`)
+    // 刷新历史列表
+    loadHistorySummaries()
+  } catch (e) {
+    loadingMsg.destroy()
+    message.error('AI 分析失败: ' + (e?.message || e))
+  } finally {
+    aiAnalyzing.value = false
+  }
+}
+
+// 进入页面时加载 AI 配置 + 历史复盘
+onBeforeMount(() => {
+  loadAiConfigs()
+  loadHistorySummaries()
+})
+
+// 操作建议（基于客观数据生成）
+const actionAdvice = computed(() => {
+  const temp = marketTemperature.value.label
+  const advices = []
+  if (temp === '极强' || temp === '强') {
+    advices.push({ icon: '✅', text: `市场温度【${temp}】，可正常加仓` })
+    advices.push({ icon: '🎯', text: '优先选择主线龙头（高热度+多连板）' })
+    advices.push({ icon: '⚠️', text: '炸板率 ' + explodedRatio.value + '%，留意分歧日' })
+  } else if (temp === '中性偏强' || temp === '中性') {
+    advices.push({ icon: '⚖️', text: `市场温度【${temp}】，半仓为宜` })
+    advices.push({ icon: '🎯', text: '只追主线，避免跟风' })
+  } else {
+    advices.push({ icon: '🛑', text: `市场温度【${temp}】，控制仓位` })
+    advices.push({ icon: '👀', text: '观望为主，等待回暖' })
+  }
+  if (dangerExploded.value.length > 0) {
+    advices.push({ icon: '🚨', text: `${dangerExploded.value.length} 只前期连板今日炸板，警惕跟风` })
+  }
+  if (relayPlates.value.length > 0) {
+    advices.push({ icon: '🔥', text: '接力主线: ' + relayPlates.value.slice(0, 2).map(p => p.name).join('、') })
+  }
+  return advices
+})
+
 function getTypeColor(type) {
   if (!type) return 'default'
   if (type === '一') return '#e03030'
@@ -404,6 +615,7 @@ function showKline(code, name) {
               <n-button :type="activeView==='plate'?'primary':'default'" size="small" @click="activeView='plate'">板块热度</n-button>
               <n-button :type="activeView==='hot'?'primary':'default'" size="small" @click="activeView='hot'">个股热度</n-button>
               <n-button :type="activeView==='exploded'?'primary':'default'" size="small" @click="activeView='exploded'">炸板股</n-button>
+              <n-button :type="activeView==='summary'?'primary':'default'" size="small" @click="activeView='summary'" strong>📊 今日复盘</n-button>
             </n-space>
           </n-space>
         </n-card>
@@ -596,6 +808,245 @@ function showKline(code, name) {
           </n-card>
         </template>
 
+        <template v-if="activeView==='summary'">
+          <n-space vertical :size="12">
+            <!-- 第一行：市场温度 -->
+            <n-card size="small" :bordered="true">
+              <template #header>
+                <n-space align="center" :size="8">
+                  <n-text style="font-weight:bold;">🌡️ 市场温度</n-text>
+                  <n-tag :type="marketTemperature.type" round size="small" style="font-weight:bold;">
+                    {{ marketTemperature.label }}
+                  </n-tag>
+                  <n-text depth="3" style="font-size:12px;">{{ marketTemperature.desc }}</n-text>
+                </n-space>
+              </template>
+              <n-grid :cols="4" :x-gap="12">
+                <n-gi>
+                  <n-statistic label="总涨停" :value="totalZtCount">
+                    <template #suffix>只</template>
+                  </n-statistic>
+                </n-gi>
+                <n-gi>
+                  <n-statistic label="最高板" :value="maxCount">
+                    <template #suffix>板</template>
+                  </n-statistic>
+                </n-gi>
+                <n-gi>
+                  <n-statistic label="炸板数" :value="explodedStocks.length">
+                    <template #suffix>只</template>
+                  </n-statistic>
+                </n-gi>
+                <n-gi>
+                  <n-statistic label="炸板率" :value="explodedRatio">
+                    <template #suffix>%</template>
+                  </n-statistic>
+                </n-gi>
+              </n-grid>
+              <n-divider style="margin: 8px 0" />
+              <n-text style="font-size:13px;" depth="2">连板分布: </n-text>
+              <n-text style="font-size:13px;font-weight:bold;">{{ ladderDistribution || '暂无数据' }}</n-text>
+            </n-card>
+
+            <!-- 第二行：主线方向 -->
+            <n-card size="small" :bordered="true">
+              <template #header>
+                <n-text style="font-weight:bold;">🎯 主线方向 TOP 3</n-text>
+              </template>
+              <n-grid :cols="3" :x-gap="12">
+                <n-gi v-for="(p, idx) in mainPlates" :key="p.code">
+                  <n-card size="small" :bordered="true" embedded :style="'border-left: 4px solid ' + (idx===0?'#e03030':idx===1?'#f0a020':'#2080f0')">
+                    <n-space justify="space-between" align="center">
+                      <n-text strong style="font-size:14px;">
+                        {{ idx===0?'🥇':idx===1?'🥈':'🥉' }} {{ p.name }}
+                      </n-text>
+                      <n-tag size="tiny" round :type="idx===0?'error':'warning'">热度 {{ p.score }}</n-tag>
+                    </n-space>
+                    <n-space :size="12" style="margin-top: 6px; font-size: 12px;">
+                      <n-text>涨停 <n-text type="error" strong>{{ p.ztCount }}</n-text> 只</n-text>
+                      <n-text>炸板 <n-text type="warning">{{ p.zbCount }}</n-text> 只</n-text>
+                      <n-text>炸板率 <n-text :type="p.plateExplodedRatio>30?'error':p.plateExplodedRatio>15?'warning':'success'">{{ p.plateExplodedRatio }}%</n-text></n-text>
+                    </n-space>
+                  </n-card>
+                </n-gi>
+              </n-grid>
+              <n-divider style="margin: 10px 0" v-if="relayPlates.length" />
+              <n-space v-if="relayPlates.length" align="center" :size="6" wrap>
+                <n-text style="font-weight:bold;font-size:13px;">🔥 接力主线:</n-text>
+                <n-tag v-for="rp in relayPlates.slice(0, 5)" :key="rp.p_code" size="small" type="error" round>{{ rp.name }}</n-tag>
+              </n-space>
+            </n-card>
+
+            <!-- 第三行：龙头候选 -->
+            <n-card size="small" :bordered="true">
+              <template #header>
+                <n-space align="center" :size="8">
+                  <n-text style="font-weight:bold;">⭐ 龙头候选 TOP 8</n-text>
+                  <n-text depth="3" style="font-size:12px;">综合 = 热度 + 连板 + 主线匹配</n-text>
+                </n-space>
+              </template>
+              <n-table :single-line="false" striped size="small" style="font-size:13px;">
+                <n-thead>
+                  <n-tr>
+                    <n-th width="40px">#</n-th>
+                    <n-th>名称</n-th>
+                    <n-th>代码</n-th>
+                    <n-th>连板</n-th>
+                    <n-th>热度</n-th>
+                    <n-th>主线</n-th>
+                    <n-th>封单</n-th>
+                    <n-th>市值</n-th>
+                    <n-th>综合分</n-th>
+                    <n-th>概念</n-th>
+                  </n-tr>
+                </n-thead>
+                <n-tbody>
+                  <n-tr v-for="(s, idx) in leaderCandidates" :key="s.code">
+                    <n-td>
+                      <n-tag v-if="idx<3" type="error" size="tiny" round>{{ idx+1 }}</n-tag>
+                      <n-text v-else depth="3">{{ idx+1 }}</n-text>
+                    </n-td>
+                    <n-td>
+                      <n-text strong style="cursor:pointer;color:#2080f0;text-decoration:underline;" @click="showKline(s.code, s.name)">
+                        {{ s.name }}
+                      </n-text>
+                    </n-td>
+                    <n-td><n-text depth="3" style="font-size:11px;">{{ s.code }}</n-text></n-td>
+                    <n-td>
+                      <n-tag v-if="s.ktTimes >= 1" :type="s.ktTimes>=4?'error':s.ktTimes>=2?'warning':'info'" size="tiny" round>
+                        {{ s.ktTimes }}板
+                      </n-tag>
+                    </n-td>
+                    <n-td><n-text :type="s.score >= hotThreshold ? 'error' : 'default'" strong>{{ s.score }}</n-text></n-td>
+                    <n-td>
+                      <n-tag v-if="s.inMain" type="error" size="tiny" round>主线✓</n-tag>
+                      <n-text v-else depth="3" style="font-size:11px;">非主线</n-text>
+                    </n-td>
+                    <n-td>
+                      <n-text :style="'color:'+getFdCloseColor(s.fd_close)+';font-weight:bold;font-size:12px;'">{{ s.fd_close }}%</n-text>
+                    </n-td>
+                    <n-td><n-text style="font-size:12px;">{{ s.market_c }}亿</n-text></n-td>
+                    <n-td>
+                      <n-progress
+                        type="line"
+                        :percentage="Math.min(100, s.totalScore)"
+                        :show-indicator="true"
+                        :color="s.totalScore>=80?'#e03030':s.totalScore>=60?'#f0a020':'#2080f0'"
+                        :height="14"
+                        :indicator-text-color="darkTheme?'#fff':'#000'"
+                      />
+                    </n-td>
+                    <n-td>
+                      <n-space :size="2" wrap>
+                        <n-tag v-for="p in s.plates.slice(0,4)" :key="p" size="tiny" :bordered="false" type="info">{{ p }}</n-tag>
+                      </n-space>
+                    </n-td>
+                  </n-tr>
+                </n-tbody>
+              </n-table>
+            </n-card>
+
+            <!-- 第四行：炸板预警 -->
+            <n-card v-if="dangerExploded.length > 0" size="small" :bordered="true">
+              <template #header>
+                <n-space align="center" :size="8">
+                  <n-text style="font-weight:bold;color:#e03030;">🚨 前期连板今日炸板</n-text>
+                  <n-text depth="3" style="font-size:12px;">这些股反映高度被压制，跟风需谨慎</n-text>
+                </n-space>
+              </template>
+              <n-space :size="8" wrap>
+                <n-card v-for="s in dangerExploded" :key="s.stock_code" size="small" :bordered="true" embedded style="border-left:3px solid #e03030">
+                  <n-space align="center" :size="8">
+                    <n-text strong style="cursor:pointer;color:#2080f0;text-decoration:underline;" @click="showKline(s.stock_code, s.stock_name)">{{ s.stock_name }}</n-text>
+                    <n-tag type="error" size="tiny" round>{{ s.up_limit_keep_times }} 连板 炸</n-tag>
+                  </n-space>
+                </n-card>
+              </n-space>
+            </n-card>
+
+            <!-- 第五行：操作建议 + AI 复盘按钮 -->
+            <n-card size="small" :bordered="true">
+              <template #header>
+                <n-space justify="space-between" align="center" style="width:100%">
+                  <n-text style="font-weight:bold;">📋 操作建议（基于客观数据）</n-text>
+                  <n-space align="center" :size="6">
+                    <n-select
+                      v-if="aiConfigs.length > 1"
+                      :value="selectedAiConfigId"
+                      :options="aiConfigOptions"
+                      size="small"
+                      style="width:200px"
+                      placeholder="选 AI 模型"
+                      @update:value="onSelectAiConfig"
+                    />
+                    <n-button type="primary" size="small" :loading="aiAnalyzing" @click="runAIAnalysis">
+                      🤖 AI 一键写分析
+                    </n-button>
+                  </n-space>
+                </n-space>
+              </template>
+              <n-space vertical :size="6">
+                <n-text v-for="(a, idx) in actionAdvice" :key="idx" style="font-size:13px;">
+                  {{ a.icon }} {{ a.text }}
+                </n-text>
+              </n-space>
+              <n-divider style="margin: 10px 0" />
+              <n-text depth="3" style="font-size:11px;">
+                ⚠️ 以上建议基于客观数据规则推演。点「AI 一键写分析」让 AI 综合分析输出 200 字复盘 + 3-5 只推荐自动入库（可在「研究中心 → AI 推荐股票」追踪）。
+              </n-text>
+            </n-card>
+
+            <!-- 第六行：历史 AI 复盘记录（持久化保存，可重新查看） -->
+            <n-card size="small" :bordered="true" v-if="historySummaries.length > 0">
+              <template #header>
+                <n-space align="center" :size="8">
+                  <n-text style="font-weight:bold;">📜 历史 AI 复盘</n-text>
+                  <n-tag type="info" size="small" round>{{ historySummaries.length }} 条</n-tag>
+                  <n-text depth="3" style="font-size:11px;">点条目可重新打开弹窗查看</n-text>
+                </n-space>
+              </template>
+              <n-table :single-line="false" striped size="small" style="font-size:13px;">
+                <n-thead>
+                  <n-tr>
+                    <n-th>复盘日期</n-th>
+                    <n-th>生成时间</n-th>
+                    <n-th>市场情绪</n-th>
+                    <n-th>模型</n-th>
+                    <n-th>推荐数</n-th>
+                    <n-th>摘要预览</n-th>
+                    <n-th width="120px">操作</n-th>
+                  </n-tr>
+                </n-thead>
+                <n-tbody>
+                  <n-tr v-for="h in historySummaries" :key="h.id">
+                    <n-td><n-tag size="small" type="default">{{ h.analyzeDate }}</n-tag></n-td>
+                    <n-td><n-text depth="3" style="font-size:11px;">{{ h.analyzeTime }}</n-text></n-td>
+                    <n-td>
+                      <n-tag size="small" round :type="h.marketSentiment === '极强' || h.marketSentiment === '强' ? 'error' : h.marketSentiment === '偏冷' ? 'success' : 'warning'">
+                        {{ h.marketSentiment }}
+                      </n-tag>
+                    </n-td>
+                    <n-td><n-text style="font-size:11px;" depth="3">{{ h.modelName }}</n-text></n-td>
+                    <n-td><n-tag size="tiny" type="info">{{ h.savedCount }} 只</n-tag></n-td>
+                    <n-td><n-ellipsis :line-clamp="2" style="max-width: 360px;">{{ h.summary }}</n-ellipsis></n-td>
+                    <n-td>
+                      <n-space :size="4">
+                        <n-button size="tiny" type="primary" @click="viewHistorySummary(h.id)">查看</n-button>
+                        <n-popconfirm @positive-click="deleteHistorySummary(h.id)">
+                          <template #trigger>
+                            <n-button size="tiny" type="error" ghost>删除</n-button>
+                          </template>
+                          确认删除这条复盘？
+                        </n-popconfirm>
+                      </n-space>
+                    </n-td>
+                  </n-tr>
+                </n-tbody>
+              </n-table>
+            </n-card>
+          </n-space>
+        </template>
+
       </n-space>
     </n-spin>
 
@@ -606,6 +1057,63 @@ function showKline(code, name) {
       <n-data-table :columns="plateStockColumns" :data="plateStocksFiltered"
         :max-height="plateTableMaxHeight" virtual-scroll
         size="small" :bordered="false" striped />
+    </n-modal>
+
+    <n-modal v-model:show="aiResultModal" preset="card"
+      :title="'🤖 AI 涨停梯队复盘 - ' + (aiResult?.analyzeDate || '')"
+      style="width: 900px; max-width: 95vw;"
+      :bordered="true" :segmented="{content:true}">
+      <n-space vertical :size="12" v-if="aiResult">
+        <n-card size="small" :bordered="true" embedded>
+          <n-space justify="space-between" align="center" style="margin-bottom:8px">
+            <n-space align="center" :size="8">
+              <n-text style="font-weight:bold;font-size:14px;">📊 市场情绪：</n-text>
+              <n-tag :type="aiResult.marketSentiment === '极强' || aiResult.marketSentiment === '强' ? 'error' : aiResult.marketSentiment === '偏冷' ? 'success' : 'warning'" round size="medium" style="font-weight:bold">
+                {{ aiResult.marketSentiment }}
+              </n-tag>
+            </n-space>
+            <n-text depth="3" style="font-size:11px;">{{ aiResult.modelName }} · {{ aiResult.analyzeTime }}</n-text>
+          </n-space>
+          <n-text style="line-height:1.7;font-size:14px;white-space:pre-wrap">{{ aiResult.summary }}</n-text>
+        </n-card>
+
+        <n-card size="small" :bordered="true" embedded>
+          <template #header>
+            <n-space align="center" :size="8">
+              <n-text style="font-weight:bold;">🎯 推荐股票</n-text>
+              <n-tag type="success" size="small" round>{{ aiResult.recommendations?.length || 0 }} 只</n-tag>
+              <n-tag type="info" size="small" round>已保存 {{ aiResult.savedCount }} 条到 AI 推荐</n-tag>
+            </n-space>
+          </template>
+          <n-space vertical :size="8">
+            <n-card v-for="(r, idx) in aiResult.recommendations" :key="r.stockCode + idx"
+              size="small" :bordered="true" embedded
+              :style="'border-left: 4px solid ' + (r.rating === '买入' ? '#e03030' : r.rating === '增持' ? '#f0a020' : '#2080f0')">
+              <n-space justify="space-between" align="center" wrap>
+                <n-space align="center" :size="8">
+                  <n-text strong style="font-size:15px;cursor:pointer;color:#2080f0;text-decoration:underline" @click="showKline(r.stockCode, r.stockName)">
+                    {{ r.stockName }}
+                  </n-text>
+                  <n-text depth="3" style="font-size:12px">{{ r.stockCode }}</n-text>
+                  <n-tag :type="r.rating === '买入' ? 'error' : r.rating === '增持' ? 'warning' : 'info'" size="small" round>{{ r.rating }}</n-tag>
+                </n-space>
+              </n-space>
+              <n-text style="display:block;margin-top:6px;font-size:13px;line-height:1.6">{{ r.reason }}</n-text>
+              <n-space :size="12" style="margin-top:8px;font-size:12px" wrap>
+                <n-text>💰 买入: <n-text type="error" strong>{{ r.buyPriceMin }} ~ {{ r.buyPriceMax }}</n-text></n-text>
+                <n-text>📈 止盈: <n-text type="success" strong>{{ r.stopProfitMin }} ~ {{ r.stopProfitMax }}</n-text></n-text>
+                <n-text>📉 止损: <n-text type="warning" strong>{{ r.stopLoss }}</n-text></n-text>
+              </n-space>
+              <n-text v-if="r.risk" depth="3" style="display:block;margin-top:6px;font-size:11px">⚠️ 风险: {{ r.risk }}</n-text>
+            </n-card>
+          </n-space>
+        </n-card>
+
+        <n-text depth="3" style="font-size:11px">
+          💡 这些推荐已自动写入数据库，可在「研究中心 → AI 推荐股票」查看完整列表并跟踪当前价。
+          AI 输出仅供参考，请结合自身判断，投资有风险。
+        </n-text>
+      </n-space>
     </n-modal>
 
     <n-modal v-model:show="showKlineModal" preset="card"

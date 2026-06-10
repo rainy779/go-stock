@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {onBeforeMount, ref} from 'vue'
-import {GetStockList, StockNotice} from "../../wailsjs/go/main/App";
+import {GetStockList, StockNotice, USStockNotice, HKStockNotice} from "../../wailsjs/go/main/App";
 import {BrowserOpenURL} from "../../wailsjs/runtime";
 import {RefreshCircleSharp} from "@vicons/ionicons5";
 import _ from "lodash";
@@ -8,31 +8,47 @@ import KLineChart from "./KLineChart.vue";
 import MoneyTrend from "./moneyTrend.vue";
 import {useMessage} from "naive-ui";
 
-const {stockCode}=defineProps(
-    {
-      stockCode: {
-        type: String,
-        default: ''
-      }
-    }
-)
+const props = defineProps({
+  stockCode: {
+    type: String,
+    default: ''
+  },
+  market: {
+    type: String,
+    default: 'a-share' // 'a-share' / 'us' / 'hk'
+  }
+})
+const stockCode = props.stockCode
 
 const list  = ref([])
 const options =  ref([])
 const message=useMessage()
 function getNotice(stockCodes) {
-  StockNotice(stockCodes).then(result => {
-    console.log(result)
-    list.value = result
+  let promise
+  if (props.market === 'us') {
+    promise = USStockNotice(stockCodes)
+  } else if (props.market === 'hk') {
+    // 港股：空 → 后端聚合 10 只热门港股；非空 → 查单股
+    promise = HKStockNotice(stockCodes || '')
+  } else {
+    promise = StockNotice(stockCodes)
+  }
+  promise.then(result => {
+    console.log(`[${props.market}] notice result`, result)
+    list.value = result || []
   })
 }
 
 onBeforeMount (()=>{
-  //message.info("正在获取数据"+stockCode)
   getNotice(stockCode);
 })
 
 function findStockList(query){
+  // 美股 / 港股不查 A 股代码字典，直接走文本搜索
+  if (props.market === 'us' || props.market === 'hk') {
+    getNotice(query || '')
+    return
+  }
   if (query){
     GetStockList(query).then(result => {
       options.value=result.map(item => {
@@ -49,8 +65,17 @@ function findStockList(query){
 function handleSearch(value) {
   getNotice(value)
 }
-function openWin(code) {
-  BrowserOpenURL("https://pdf.dfcfw.com/pdf/H2_"+code+"_1.pdf?1750092081000.pdf")
+function openWin(item) {
+  // 美股 SEC EDGAR 直接打开 filing URL
+  if (item && item.infoLink) {
+    BrowserOpenURL(item.infoLink)
+    return
+  }
+  // A股 东财 PDF
+  const code = (item && item.art_code) ? item.art_code : item
+  if (code) {
+    BrowserOpenURL("https://pdf.dfcfw.com/pdf/H2_"+code+"_1.pdf?1750092081000.pdf")
+  }
 }
 function getTypeColor(name){
   if(name.includes("质押")||name.includes("冻结")||name.includes("解冻")||name.includes("解押")||name.includes("解禁")){
@@ -95,13 +120,26 @@ function getmMarketCode(market,code) {
 
 <template>
   <n-card>
-    <n-auto-complete  :options="options" placeholder="请输入A股名称或者代码"  clearable filterable  :on-select="handleSearch" :on-update:value="findStockList"  />
+    <n-auto-complete v-if="market === 'a-share'"
+                     :options="options"
+                     placeholder="请输入A股名称或者代码"
+                     clearable filterable
+                     :on-select="handleSearch"
+                     :on-update:value="findStockList" />
+    <n-input v-else-if="market === 'us'"
+             placeholder="按公司名/CIK 过滤（留空看全市场最新）"
+             clearable
+             @update:value="handleSearch" />
+    <n-input v-else
+             placeholder="留空看热门 10 只港股聚合，或输入代码查单只（如 00700 腾讯、09988 阿里）"
+             clearable
+             @update:value="handleSearch" />
   </n-card>
   <n-table striped size="small">
     <n-thead>
       <n-tr>
-        <n-th>股票代码</n-th>
-        <n-th>股票名称</n-th>
+        <n-th>{{ market === 'us' ? 'CIK' : (market === 'hk' ? '港股代码' : '股票代码') }}</n-th>
+        <n-th>{{ market === 'us' ? '公司名称' : (market === 'hk' ? '公司名称' : '股票名称') }}</n-th>
         <n-th>公告标题</n-th>
         <n-th>公告类型</n-th>
         <n-th>公告日期</n-th>
@@ -109,34 +147,38 @@ function getmMarketCode(market,code) {
       </n-tr>
     </n-thead>
     <n-tbody>
-      <n-tr v-for="item in list" :key="item.art_code">
+      <n-tr v-for="(item, idx) in list" :key="(item.art_code || item.infoLink || idx)">
         <n-td>
-          <n-popover trigger="hover" placement="right">
+          <!-- A 股：hover 显示资金流向；美股：CIK 只显示 tag -->
+          <n-popover v-if="market === 'a-share'" trigger="hover" placement="right">
             <template #trigger>
               <n-tag type="info"  :bordered="false">{{item.codes[0].stock_code }}</n-tag>
             </template>
             <money-trend style="width: 800px" :code="getmMarketCode(item.codes[0].market_code,item.codes[0].stock_code)" :name="item.codes[0].short_name"  :days="360" :dark-theme="true" :chart-height="500"></money-trend>
           </n-popover>
+          <n-tag v-else type="info" :bordered="false">{{item.codes[0].stock_code}}</n-tag>
         </n-td>
         <n-td>
-          <n-popover trigger="hover" placement="right">
+          <!-- A 股：hover 显示 K线；美股：直接显示名字 -->
+          <n-popover v-if="market === 'a-share'" trigger="hover" placement="right">
             <template #trigger>
               <n-tag type="info"  :bordered="false">{{item.codes[0].short_name }}</n-tag>
             </template>
             <k-line-chart style="width: 800px" :code="getmMarketCode(item.codes[0].market_code,item.codes[0].stock_code)" :chart-height="500" :stockName="item.codes[0].short_name" :k-days="20" :dark-theme="true"></k-line-chart>
           </n-popover>
+          <n-tag v-else type="info" :bordered="false">{{item.codes[0].short_name}}</n-tag>
         </n-td>
         <n-td>
-          <n-a type="info"  @click="openWin(item.art_code)"><n-text  :type="getTypeColor(item.columns[0].column_name)"> {{item.title}}</n-text></n-a>
+          <n-a type="info"  @click="openWin(item)"><n-text  :type="getTypeColor(item.columns[0].column_name)"> {{item.title}}</n-text></n-a>
         </n-td>
         <n-td>
           <n-text :type="getTypeColor(item.columns[0].column_name)">{{item.columns[0].column_name }}</n-text>
         </n-td>
         <n-td>
-          <n-tag type="info">{{item.notice_date.substring(0,10) }}</n-tag>
+          <n-tag type="info">{{(item.notice_date || '').substring(0,10) }}</n-tag>
         </n-td>
         <n-td>
-          <n-tag type="info">{{item.display_time.substring(0,19)}}</n-tag>
+          <n-tag type="info">{{(item.display_time || '').substring(0,19)}}</n-tag>
         </n-td>
       </n-tr>
     </n-tbody>

@@ -1469,8 +1469,15 @@ func (receiver StockDataApi) GetStockMinutePriceData(stockCode string) (*[]Minut
 	stockCode = ConvertTushareCodeToStockCode(stockCode)
 
 	url := fmt.Sprintf("https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=%s", stockCode)
+	// 美股：腾讯要求 ticker 必须大写（usNVDA 而不是 usnvda）
+	// 兼容输入: "gb_nvda" / "usnvda" / "us.NVDA"
 	if strutil.HasPrefixAny(stockCode, []string{"gb_", "GB_"}) {
-		stockCode = strings.Replace(strings.ToUpper(stockCode), "GB_", "us", 1) + ".OQ"
+		ticker := strings.ToUpper(strings.TrimPrefix(strings.ToUpper(stockCode), "GB_"))
+		stockCode = "us" + ticker
+	} else if strutil.HasPrefixAny(stockCode, []string{"us", "US"}) {
+		// 已经是 us 前缀，但 ticker 部分可能是小写
+		ticker := strings.ToUpper(strings.TrimPrefix(strings.ToLower(stockCode), "us"))
+		stockCode = "us" + ticker
 	}
 	if strutil.HasPrefixAny(stockCode, []string{"us", "US"}) {
 		url = fmt.Sprintf("https://web.ifzq.gtimg.cn/appstock/app/UsMinute/query?code=%s", stockCode)

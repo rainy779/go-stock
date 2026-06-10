@@ -12,6 +12,8 @@ import {
   IsHKTradingTime,
   IsUSTradingTime,
   ReFleshTelegraphList,
+  ReFleshTelegraphListHK,
+  ReFleshTelegraphListUS,
   SaveAIResponseResult,
   SaveAsMarkdown,
   ShareAnalysis,
@@ -32,6 +34,7 @@ import StockResearchReportList from "./StockResearchReportList.vue";
 import StockNoticeList from "./StockNoticeList.vue";
 import LongTigerRankList from "./LongTigerRankList.vue";
 import IndustryResearchReportList from "./IndustryResearchReportList.vue";
+import MarketHotWordsTreemap from "./MarketHotWordsTreemap.vue";
 import HotStockList from "./HotStockList.vue";
 import HotEvents from "./HotEvents.vue";
 import HotTopics from "./HotTopics.vue";
@@ -49,6 +52,17 @@ const panelHeight = ref(window.innerHeight - 240)
 const telegraphList = ref([])
 const sinaNewsList = ref([])
 const foreignNewsList = ref([])
+// 港股快讯 - 3 个源
+const hkWscnList = ref([])      // 华尔街见闻港股
+const hkTvList = ref([])        // TradingView 港股
+const hkEmList = ref([])        // 东方财富港股
+// 美股快讯 - 3 个源
+const usWscnList = ref([])      // 华尔街见闻美股
+const usTvList = ref([])        // TradingView 美股
+const usEmList = ref([])        // 东方财富美股
+// 港股美股 24h 热词 treemap 显隐
+const showHkTreemap = ref(false)
+const showUsTreemap = ref(false)
 const common = ref([])
 const america = ref([])
 const europe = ref([])
@@ -382,18 +396,42 @@ function share() {
 }
 
 function ReFlesh(source) {
-  //console.log("ReFlesh:", source)
+  // 港股相关
+  if (source === "华尔街见闻-港股" || source === "TradingView-港股" || source === "新浪-港股") {
+    ReFleshTelegraphListHK(source).then(res => {
+      if (source === "华尔街见闻-港股") hkWscnList.value = res
+      if (source === "TradingView-港股") hkTvList.value = res
+      if (source === "新浪-港股") hkEmList.value = res
+    })
+    return
+  }
+  // 美股相关
+  if (source === "华尔街见闻-美股" || source === "TradingView-美股" || source === "新浪-美股") {
+    ReFleshTelegraphListUS(source).then(res => {
+      if (source === "华尔街见闻-美股") usWscnList.value = res
+      if (source === "TradingView-美股") usTvList.value = res
+      if (source === "新浪-美股") usEmList.value = res
+    })
+    return
+  }
+  // 沪深 A 股
   ReFleshTelegraphList(source).then(res => {
-    if (source === "财联社电报") {
-      telegraphList.value = res
-    }
-    if (source === "新浪财经") {
-      sinaNewsList.value = res
-    }
-    if (source === "外媒") {
-      foreignNewsList.value = res
-    }
+    if (source === "财联社电报") telegraphList.value = res
+    if (source === "新浪财经") sinaNewsList.value = res
+    if (source === "外媒") foreignNewsList.value = res
   })
+}
+
+// 进入港股/美股 Tab 时一次性加载 3 列
+function loadHKAll() {
+  ReFlesh("华尔街见闻-港股")
+  ReFlesh("TradingView-港股")
+  ReFlesh("新浪-港股")
+}
+function loadUSAll() {
+  ReFlesh("华尔街见闻-美股")
+  ReFlesh("TradingView-美股")
+  ReFlesh("新浪-美股")
 }
 </script>
 
@@ -406,18 +444,72 @@ function ReFlesh(source) {
             <AnalyzeMartket :dark-theme="darkTheme" :chart-height="300" :kDays="1" :name="'最近24小时热词'" />
           </n-gi>
           <n-gi>
-            <n-grid :cols="foreignNewsList.length?3:2" :y-gap="0">
-              <n-gi>
-                <news-list :newsList="telegraphList" :header-title="'财联社电报'" @update:message="ReFlesh"></news-list>
-              </n-gi>
-              <n-gi>
-                <news-list :newsList="sinaNewsList" :header-title="'新浪财经'" @update:message="ReFlesh"></news-list>
-              </n-gi>
-              <n-gi v-if="foreignNewsList.length>0">
-                <news-list :newsList="foreignNewsList" :header-title="'外媒'" @update:message="ReFlesh"></news-list>
-              </n-gi>
-
-            </n-grid>
+            <n-tabs type="segment" animated default-value="沪深"
+                    @update-value="(v) => { if(v==='港股') loadHKAll(); if(v==='美股') loadUSAll() }">
+              <n-tab-pane name="沪深" tab="沪深 A 股">
+                <n-grid :cols="foreignNewsList.length?3:2" :y-gap="0">
+                  <n-gi>
+                    <news-list :newsList="telegraphList" :header-title="'财联社电报'" @update:message="ReFlesh"></news-list>
+                  </n-gi>
+                  <n-gi>
+                    <news-list :newsList="sinaNewsList" :header-title="'新浪财经'" @update:message="ReFlesh"></news-list>
+                  </n-gi>
+                  <n-gi v-if="foreignNewsList.length>0">
+                    <news-list :newsList="foreignNewsList" :header-title="'外媒'" @update:message="ReFlesh"></news-list>
+                  </n-gi>
+                </n-grid>
+              </n-tab-pane>
+              <n-tab-pane name="港股" tab="港股">
+                <n-flex justify="center" style="margin: 8px 0">
+                  <n-button text @click="showHkTreemap = !showHkTreemap" :type="showHkTreemap ? 'primary' : ''">
+                    {{ showHkTreemap ? '隐藏热词' : '查看热词' }}
+                  </n-button>
+                </n-flex>
+                <n-collapse-transition :show="showHkTreemap">
+                  <MarketHotWordsTreemap v-if="showHkTreemap"
+                                          market="hk"
+                                          name="港股 24 小时热词"
+                                          :chart-height="300"
+                                          :dark-theme="darkTheme" />
+                </n-collapse-transition>
+                <n-grid :cols="3" :y-gap="0">
+                  <n-gi>
+                    <news-list :newsList="hkWscnList" :header-title="'华尔街见闻-港股'" @update:message="ReFlesh"></news-list>
+                  </n-gi>
+                  <n-gi>
+                    <news-list :newsList="hkTvList" :header-title="'TradingView-港股'" @update:message="ReFlesh"></news-list>
+                  </n-gi>
+                  <n-gi>
+                    <news-list :newsList="hkEmList" :header-title="'新浪-港股'" @update:message="ReFlesh"></news-list>
+                  </n-gi>
+                </n-grid>
+              </n-tab-pane>
+              <n-tab-pane name="美股" tab="美股">
+                <n-flex justify="center" style="margin: 8px 0">
+                  <n-button text @click="showUsTreemap = !showUsTreemap" :type="showUsTreemap ? 'primary' : ''">
+                    {{ showUsTreemap ? '隐藏热词' : '查看热词' }}
+                  </n-button>
+                </n-flex>
+                <n-collapse-transition :show="showUsTreemap">
+                  <MarketHotWordsTreemap v-if="showUsTreemap"
+                                          market="us"
+                                          name="美股 24 小时热词"
+                                          :chart-height="300"
+                                          :dark-theme="darkTheme" />
+                </n-collapse-transition>
+                <n-grid :cols="3" :y-gap="0">
+                  <n-gi>
+                    <news-list :newsList="usWscnList" :header-title="'华尔街见闻-美股'" @update:message="ReFlesh"></news-list>
+                  </n-gi>
+                  <n-gi>
+                    <news-list :newsList="usTvList" :header-title="'TradingView-美股'" @update:message="ReFlesh"></news-list>
+                  </n-gi>
+                  <n-gi>
+                    <news-list :newsList="usEmList" :header-title="'新浪-美股'" @update:message="ReFlesh"></news-list>
+                  </n-gi>
+                </n-grid>
+              </n-tab-pane>
+            </n-tabs>
           </n-gi>
         </n-grid>
 
@@ -707,10 +799,30 @@ function ReFlesh(source) {
         <StockResearchReportList :stock-code="stockCode"/>
       </n-tab-pane>
       <n-tab-pane name="公司公告" tab="公司公告 ">
-        <StockNoticeList :stock-code="stockCode" />
+        <n-tabs type="segment" animated default-value="沪深">
+          <n-tab-pane name="沪深" tab="沪深 A 股">
+            <StockNoticeList :stock-code="stockCode" market="a-share"/>
+          </n-tab-pane>
+          <n-tab-pane name="美股" tab="美股 (SEC EDGAR)">
+            <StockNoticeList :stock-code="''" market="us"/>
+          </n-tab-pane>
+          <n-tab-pane name="港股" tab="港股 (新浪)">
+            <StockNoticeList :stock-code="''" market="hk"/>
+          </n-tab-pane>
+        </n-tabs>
       </n-tab-pane>
       <n-tab-pane name="行业研究" tab="行业研究 ">
-        <IndustryResearchReportList/>
+        <n-tabs type="segment" animated default-value="沪深">
+          <n-tab-pane name="沪深" tab="沪深 A 股">
+            <IndustryResearchReportList market="a-share"/>
+          </n-tab-pane>
+          <n-tab-pane name="港股" tab="港股">
+            <IndustryResearchReportList market="hk"/>
+          </n-tab-pane>
+          <n-tab-pane name="美股" tab="美股">
+            <IndustryResearchReportList market="us"/>
+          </n-tab-pane>
+        </n-tabs>
       </n-tab-pane>
       <n-tab-pane name="当前热门" tab="当前热门">
         <n-tabs type="card" animated>

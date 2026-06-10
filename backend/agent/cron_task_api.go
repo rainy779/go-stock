@@ -135,6 +135,7 @@ func (a *CronTaskApi) GetTaskTypes() []lo.Tuple2[string, string] {
 		{A: "market_analysis", B: "市场分析"},
 		{A: "global_stock_index_cache", B: "全球指数缓存"},
 		{A: "stock_change_save", B: "异动数据保存"},
+		{A: "tg_daily_push", B: "TG 每日推送"},
 	}
 }
 
@@ -214,6 +215,8 @@ func (a *CronTaskApi) executeTaskByType(ctx context.Context, task *models.CronTa
 		return a.executeStockMonitor(ctx, task)
 	case "stock_change_save":
 		return a.executeStockChangeSave(ctx, task)
+	case "tg_daily_push":
+		return a.executeTGDailyPush(ctx, task)
 	case "custom":
 		return a.executeCustomTask(ctx, task)
 	default:
@@ -438,6 +441,32 @@ func (a *CronTaskApi) executeStockChangeSave(ctx context.Context, task *models.C
 	}
 
 	return nil
+}
+
+// executeTGDailyPush 执行 TG 每日推送任务
+// Params: {"mode": "morning" | "afternoon"}
+func (a *CronTaskApi) executeTGDailyPush(ctx context.Context, task *models.CronTask) error {
+	logger.SugaredLogger.Infof("执行 TG 每日推送任务：%s", task.Name)
+
+	var params data.TGPushParams
+	if task.Params != "" {
+		if err := json.Unmarshal([]byte(task.Params), &params); err != nil {
+			return fmt.Errorf("解析 TG 推送参数失败: %w", err)
+		}
+	}
+	mode := data.TGDailyPushMode(params.Mode)
+	if mode != data.TGModeMorning && mode != data.TGModeAfternoon {
+		// 没指定模式时按当前时间猜：14 点之后算 afternoon
+		if time.Now().Hour() >= 12 {
+			mode = data.TGModeAfternoon
+		} else {
+			mode = data.TGModeMorning
+		}
+	}
+
+	log, err := data.RunTGDailyPush(ctx, mode)
+	logger.SugaredLogger.Infof("[TG 推送日志]\n%s", log)
+	return err
 }
 
 func isTradingTime() bool {

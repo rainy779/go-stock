@@ -12,6 +12,8 @@ import {NAvatar, NButton, NEllipsis, NSwitch, NTag, NText, useMessage, useNotifi
 import StockLightweightKlineChart from "./StockLightweightKlineChart.vue";
 import sparkLine from "./stockSparkLine.vue"
 import {format} from "date-fns";
+import * as XLSX from 'xlsx';
+import {saveAs} from 'file-saver';
 
 const notify = useNotification()
 const vipLevel=ref("");
@@ -335,6 +337,120 @@ const theme = computed(() => {
 })
 
 
+// 拉取当前筛选条件下的全量数据（不分页）用于导出
+function fetchAllForExport() {
+  return new Promise((resolve, reject) => {
+    GetAiRecommendStocksList({
+      page: 1,
+      pageSize: 10000,
+      modelName: paginationReactive.keyword,
+      stockName: paginationReactive.keyword,
+      stockCode: paginationReactive.keyword,
+      bkName: paginationReactive.keyword,
+      startDate: formatDate(paginationReactive.range[0]),
+      endDate: formatDate(paginationReactive.range[1]),
+      enableAlert: paginationReactive.enableAlert
+    }).then(res => {
+      resolve(res.list || []);
+    }).catch(reject);
+  });
+}
+
+// 把记录转成中文表头的扁平 row（用于 xlsx / json）
+function toExportRow(item) {
+  return {
+    '股票代码': item.stockCode || '',
+    '股票名称': item.stockName || '',
+    '行业/板块': item.bkName || '',
+    '评级': item.rating || '',
+    '模型': item.modelName || '',
+    '推荐时价': item.stockPrice || '',
+    '当前价': item.stockCurrentPrice || '',
+    '前日收盘价': item.stockPrePrice || '',
+    '当前价时间': item.stockCurrentPriceTime || '',
+    '建议买入价': item.recommendBuyPrice || '',
+    '买入下限': item.recommendBuyPriceMin || '',
+    '买入上限': item.recommendBuyPriceMax || '',
+    '建议止盈价': item.recommendStopProfitPrice || '',
+    '止盈下限': item.recommendStopProfitPriceMin || '',
+    '止盈上限': item.recommendStopProfitPriceMax || '',
+    '建议止损价': item.recommendStopLossPrice || '',
+    '推荐理由': item.recommendReason || '',
+    '风险提示': item.riskRemarks || '',
+    '备注': item.remarks || '',
+    '已开启预警': item.enableAlert ? '是' : '否',
+    '推荐时间': item.dataTime ? format(new Date(item.dataTime), 'yyyy-MM-dd HH:mm:ss') : '',
+  };
+}
+
+function downloadFileName(ext) {
+  return `AI股票推荐_${format(new Date(), 'yyyyMMdd_HHmmss')}.${ext}`;
+}
+
+async function exportXlsx() {
+  try {
+    message.loading('正在导出 XLSX...', { duration: 0 });
+    const list = await fetchAllForExport();
+    if (!list.length) {
+      message.destroyAll();
+      message.warning('当前筛选条件下没有数据可导出');
+      return;
+    }
+    const rows = list.map(toExportRow);
+    const ws = XLSX.utils.json_to_sheet(rows);
+
+    // 自适应列宽（按表头/值长度估算）
+    const colWidths = Object.keys(rows[0]).map(key => {
+      const maxLen = Math.max(
+        key.length * 2, // 中文表头按 2 倍宽
+        ...rows.slice(0, 200).map(r => String(r[key] ?? '').length)
+      );
+      return { wch: Math.min(60, Math.max(10, maxLen + 2)) };
+    });
+    ws['!cols'] = colWidths;
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'AI推荐');
+    const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+    saveAs(new Blob([buf], { type: 'application/octet-stream' }), downloadFileName('xlsx'));
+    message.destroyAll();
+    message.success(`已导出 ${list.length} 条记录`);
+  } catch (e) {
+    message.destroyAll();
+    message.error('导出 XLSX 失败: ' + (e?.message || e));
+  }
+}
+
+async function exportJson() {
+  try {
+    message.loading('正在导出 JSON...', { duration: 0 });
+    const list = await fetchAllForExport();
+    if (!list.length) {
+      message.destroyAll();
+      message.warning('当前筛选条件下没有数据可导出');
+      return;
+    }
+    const payload = {
+      exportedAt: format(new Date(), 'yyyy-MM-dd HH:mm:ss'),
+      filter: {
+        keyword: paginationReactive.keyword,
+        startDate: formatDate(paginationReactive.range[0]),
+        endDate: formatDate(paginationReactive.range[1]),
+        enableAlert: paginationReactive.enableAlert,
+      },
+      total: list.length,
+      list,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    saveAs(blob, downloadFileName('json'));
+    message.destroyAll();
+    message.success(`已导出 ${list.length} 条记录`);
+  } catch (e) {
+    message.destroyAll();
+    message.error('导出 JSON 失败: ' + (e?.message || e));
+  }
+}
+
 function query({
                  page,
                  pageSize = 10,
@@ -487,6 +603,12 @@ function toggleAlert(row, newEnableAlert) {
     <n-input clearable placeholder="输入关键词搜索" v-model:value="paginationReactive.keyword"/>
     <n-button type="primary" ghost @click="handleSearch"  @input="handleSearch">
       搜索
+    </n-button>
+    <n-button type="success" ghost @click="exportXlsx" title="导出当前筛选条件下的全部记录为 XLSX">
+      导出 XLSX
+    </n-button>
+    <n-button type="info" ghost @click="exportJson" title="导出当前筛选条件下的全部记录为 JSON">
+      导出 JSON
     </n-button>
   </n-input-group>
         <n-data-table

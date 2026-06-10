@@ -42,8 +42,16 @@ export function AnalyzeSentiment(arg1) {
   return window['go']['main']['App']['AnalyzeSentiment'](arg1);
 }
 
+export function AnalyzeSentimentByMarket(arg1) {
+  return window['go']['main']['App']['AnalyzeSentimentByMarket'](arg1);
+}
+
 export function AnalyzeSentimentWithFreqWeight(arg1) {
   return window['go']['main']['App']['AnalyzeSentimentWithFreqWeight'](arg1);
+}
+
+export function AnalyzeUplimitWithAI(arg1, arg2) {
+  return window['go']['main']['App']['AnalyzeUplimitWithAI'](arg1, arg2);
 }
 
 export function BatchDeleteAIResponseResult(arg1) {
@@ -144,6 +152,10 @@ export function DeleteStockChangeHistory(arg1) {
 
 export function DeleteTradingRecord(arg1) {
   return window['go']['main']['App']['DeleteTradingRecord'](arg1);
+}
+
+export function DeleteUplimitAISummary(arg1) {
+  return window['go']['main']['App']['DeleteUplimitAISummary'](arg1);
 }
 
 export function EMDictCode(arg1) {
@@ -494,6 +506,14 @@ export function GetTypeStatsByDate(arg1) {
   return window['go']['main']['App']['GetTypeStatsByDate'](arg1);
 }
 
+export function GetUplimitAISummaries(arg1) {
+  return window['go']['main']['App']['GetUplimitAISummaries'](arg1);
+}
+
+export function GetUplimitAISummaryDetail(arg1) {
+  return window['go']['main']['App']['GetUplimitAISummaryDetail'](arg1);
+}
+
 export function GetUplimitHot(arg1, arg2) {
   return window['go']['main']['App']['GetUplimitHot'](arg1, arg2);
 }
@@ -520,6 +540,14 @@ export function GlobalStockIndexesReadable() {
 
 export function Greet(arg1) {
   return window['go']['main']['App']['Greet'](arg1);
+}
+
+export function HKIndustryResearchReport(arg1) {
+  return window['go']['main']['App']['HKIndustryResearchReport'](arg1);
+}
+
+export function HKStockNotice(arg1) {
+  return window['go']['main']['App']['HKStockNotice'](arg1);
 }
 
 export function HideToTray() {
@@ -594,6 +622,14 @@ export function ReFleshTelegraphList(arg1) {
   return window['go']['main']['App']['ReFleshTelegraphList'](arg1);
 }
 
+export function ReFleshTelegraphListHK(arg1) {
+  return window['go']['main']['App']['ReFleshTelegraphListHK'](arg1);
+}
+
+export function ReFleshTelegraphListUS(arg1) {
+  return window['go']['main']['App']['ReFleshTelegraphListUS'](arg1);
+}
+
 export function RemoveGroup(arg1) {
   return window['go']['main']['App']['RemoveGroup'](arg1);
 }
@@ -654,6 +690,10 @@ export function SendDingDingMessageByType(arg1, arg2, arg3) {
   return window['go']['main']['App']['SendDingDingMessageByType'](arg1, arg2, arg3);
 }
 
+export function SendTestTelegramMessage(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SendTestTelegramMessage'](arg1, arg2, arg3);
+}
+
 export function SetAlarmChangePercent(arg1, arg2, arg3) {
   return window['go']['main']['App']['SetAlarmChangePercent'](arg1, arg2, arg3);
 }
@@ -700,6 +740,18 @@ export function SummaryStockNews(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
 
 export function TestMCPServer(arg1) {
   return window['go']['main']['App']['TestMCPServer'](arg1);
+}
+
+export function TriggerTGDailyPush(arg1) {
+  return window['go']['main']['App']['TriggerTGDailyPush'](arg1);
+}
+
+export function USIndustryResearchReport(arg1) {
+  return window['go']['main']['App']['USIndustryResearchReport'](arg1);
+}
+
+export function USStockNotice(arg1) {
+  return window['go']['main']['App']['USStockNotice'](arg1);
 }
 
 export function UnFollow(arg1) {

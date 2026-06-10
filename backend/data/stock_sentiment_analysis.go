@@ -558,9 +558,48 @@ func SaveStockSentimentAnalysis(result models.SentimentResult) {
 	})
 }
 
+// 默认 A 股新闻 source 列表（用于 NewsAnalyze 默认行为 + market="a-share" 分支）
+// 显式列举，避免被新加的港股/美股 source 污染
+var aShareDefaultSources = []string{"财联社电报", "新浪财经", "外媒"}
+
+// NewsAnalyzeByMarket 按市场（hk/us/a-share）拉取对应 source 的近24h新闻，做词频+情感分析
+// 用于市场快讯 → 港股/美股 24小时热词 treemap
+func NewsAnalyzeByMarket(market string) (models.SentimentResult, []models.WordFreqWithWeight) {
+	var sources []string
+	switch market {
+	case "hk":
+		sources = []string{"华尔街见闻-港股", "TradingView-港股", "新浪-港股"}
+	case "us":
+		sources = []string{"华尔街见闻-美股", "TradingView-美股", "新浪-美股"}
+	default:
+		// A 股 或其他 → 走原有全市场逻辑
+		return NewsAnalyze("", false)
+	}
+
+	telegraphs := NewMarketNewsApi().GetNews24HoursListBySources(sources, 10000)
+	if telegraphs == nil || len(*telegraphs) == 0 {
+		return models.SentimentResult{}, []models.WordFreqWithWeight{}
+	}
+	messageText := strings.Builder{}
+	for _, t := range *telegraphs {
+		if t.Content != "" {
+			messageText.WriteString(t.Content + "\n")
+		} else if t.Title != "" {
+			messageText.WriteString(t.Title + "\n")
+		}
+	}
+	if messageText.Len() == 0 {
+		return models.SentimentResult{}, []models.WordFreqWithWeight{}
+	}
+	result, frequencies := AnalyzeSentimentWithFreqWeight(messageText.String())
+	cleanFrequencies := FilterAndSortWords(frequencies)
+	return result, cleanFrequencies
+}
+
 func NewsAnalyze(text string, save bool) (models.SentimentResult, []models.WordFreqWithWeight) {
 	if text == "" {
-		telegraphs := NewMarketNewsApi().GetNews24HoursList("", 1000*10)
+		// 默认只用 A 股 source，避免被港股美股 source 污染热词分析
+		telegraphs := NewMarketNewsApi().GetNews24HoursListBySources(aShareDefaultSources, 1000*10)
 		messageText := strings.Builder{}
 		for _, telegraph := range *telegraphs {
 			messageText.WriteString(telegraph.Content + "\n")

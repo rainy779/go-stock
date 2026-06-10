@@ -1,15 +1,21 @@
 package data
 
 import (
+	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"go-stock/backend/db"
 	"go-stock/backend/logger"
 	"go-stock/backend/models"
 	"go-stock/backend/util"
+	"html"
 	"net/url"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -19,7 +25,102 @@ import (
 	"github.com/robertkrimen/otto"
 	"github.com/samber/lo"
 	"github.com/tidwall/gjson"
+	"golang.org/x/net/html/charset"
 )
+
+// 翻译缓存 - 进程内 map，避免重复翻译相同标题
+var translateCache = sync.Map{}
+
+// containsChineseChar 检测字符串里是否含至少一个中文字符
+func containsChineseChar(s string) bool {
+	for _, r := range s {
+		if r >= 0x4e00 && r <= 0x9fff {
+			return true
+		}
+	}
+	return false
+}
+
+// TranslateBatch 批量把英文翻译为简体中文，自动跳过已有中文的，自动缓存
+// 失败的项返回原文
+func (m MarketNewsApi) TranslateBatch(texts []string) []string {
+	if len(texts) == 0 {
+		return texts
+	}
+	result := make([]string, len(texts))
+	var needTranslate []string
+	var needIdx []int
+
+	// 第一遍：用缓存 + 跳过中文
+	for i, t := range texts {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			result[i] = t
+			continue
+		}
+		if cached, ok := translateCache.Load(t); ok {
+			result[i] = cached.(string)
+			continue
+		}
+		if containsChineseChar(t) {
+			result[i] = t
+			translateCache.Store(t, t)
+			continue
+		}
+		needTranslate = append(needTranslate, t)
+		needIdx = append(needIdx, i)
+	}
+	if len(needTranslate) == 0 {
+		return result
+	}
+
+	// 用换行分隔批量翻译（Google Translate 会按行返回）
+	combined := strings.Join(needTranslate, "\n")
+	apiUrl := "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=" + url.QueryEscape(combined)
+
+	resp, err := SharedHTTPClient.SetTimeout(time.Duration(15)*time.Second).R().
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/117.0.0.0").
+		Get(apiUrl)
+	if err != nil {
+		logger.SugaredLogger.Warnf("TranslateBatch err: %v", err)
+		// 失败 → 全部塞回原文
+		for k, idx := range needIdx {
+			result[idx] = needTranslate[k]
+		}
+		return result
+	}
+
+	// Google 返回:
+	// [[["译文段1","原文段1",null,null,1],["译文段2","原文段2",...],...], null, "en", ...]
+	// 每个换行在 Google 内可能拆成多段，所以拼起来再按 \n 切
+	items := gjson.Parse(string(resp.Body())).Get("0")
+	if !items.IsArray() {
+		for k, idx := range needIdx {
+			result[idx] = needTranslate[k]
+		}
+		return result
+	}
+	var sb strings.Builder
+	items.ForEach(func(_, v gjson.Result) bool {
+		sb.WriteString(v.Get("0").String())
+		return true
+	})
+	parts := strings.Split(sb.String(), "\n")
+
+	for k, idx := range needIdx {
+		if k < len(parts) {
+			trans := strings.TrimSpace(parts[k])
+			if trans != "" {
+				result[idx] = trans
+				translateCache.Store(needTranslate[k], trans)
+				continue
+			}
+		}
+		// fallback 原文
+		result[idx] = needTranslate[k]
+	}
+	return result
+}
 
 // @Author spark
 // @Date 2025/4/23 14:54
@@ -723,6 +824,177 @@ func (m MarketNewsApi) LongTiger(date string) *[]models.LongTigerRankData {
 	return ranks
 }
 
+// HKIndustryResearchReport 港股相关研究/资讯
+// 数据源：东财 qType=2 海外研报（中文过滤）+ Yahoo Finance 港股相关英文新闻
+func (m MarketNewsApi) HKIndustryResearchReport(industryCode string, days int) []any {
+	keywords := []string{"港股", "恒生", "腾讯", "阿里", "美团", "百度", "京东", "比亚迪",
+		"汇丰", "友邦", "小米", "蔚来", "理想", "网易", "携程", "快手",
+		"中海油", "中国移动", "中国联通", "中国电信", "招商局", "中海洋",
+		"H股", "Hong Kong", "香港"}
+	cn := m.industryResearchReportByQType(industryCode, days, "2", keywords)
+	en := m.YahooFinanceNews([]string{
+		"Hang Seng Index", "Hong Kong stocks", "China stocks",
+		"Tencent", "Alibaba", "BYD", "Xiaomi", "NIO", "Baidu", "JD.com",
+	})
+	return append(cn, en...)
+}
+
+// USIndustryResearchReport 美股相关研究/资讯
+// 数据源：东财 qType=2 海外研报（中文过滤）+ Yahoo Finance 美股板块英文新闻
+func (m MarketNewsApi) USIndustryResearchReport(industryCode string, days int) []any {
+	keywords := []string{"美股", "纳指", "纳斯达克", "道琼斯", "标普", "苹果", "英伟达",
+		"特斯拉", "微软", "谷歌", "亚马逊", "Meta", "AMD", "OpenAI",
+		"Salesforce", "Netflix", "Nvidia", "Apple", "Tesla", "Google",
+		"Amazon", "Microsoft", "Berkshire", "美联储", "美国"}
+	cn := m.industryResearchReportByQType(industryCode, days, "2", keywords)
+	en := m.YahooFinanceNews([]string{
+		"S&P 500", "Nasdaq", "Dow Jones",
+		"Technology stocks", "AI stocks", "Semiconductor",
+		"Energy stocks", "Healthcare stocks", "Financial stocks",
+	})
+	return append(cn, en...)
+}
+
+// YahooFinanceNews 抓 Yahoo Finance 新闻搜索 API，按多个关键词聚合后转成 IndustryResearchReport 兼容 schema
+func (m MarketNewsApi) YahooFinanceNews(queries []string) []any {
+	results := []any{}
+	seen := map[string]bool{}
+
+	for _, q := range queries {
+		apiUrl := fmt.Sprintf("https://query1.finance.yahoo.com/v1/finance/search?q=%s&newsCount=8&quotesCount=0",
+			url.QueryEscape(q))
+		resp, err := SharedHTTPClient.SetTimeout(time.Duration(10)*time.Second).R().
+			SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36").
+			SetHeader("Accept", "application/json").
+			Get(apiUrl)
+		if err != nil {
+			logger.SugaredLogger.Warnf("YahooFinanceNews query=%s err: %v", q, err)
+			continue
+		}
+		respMap := map[string]any{}
+		if err := json.Unmarshal(resp.Body(), &respMap); err != nil {
+			continue
+		}
+		news, ok := respMap["news"].([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range news {
+			article, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			title, _ := article["title"].(string)
+			if title == "" || seen[title] {
+				continue
+			}
+			seen[title] = true
+
+			var publishDate string
+			if pt, ok := article["providerPublishTime"].(float64); ok {
+				publishDate = time.Unix(int64(pt), 0).Local().Format("2006-01-02 15:04:05")
+			} else {
+				publishDate = time.Now().Format("2006-01-02 15:04:05")
+			}
+
+			link, _ := article["link"].(string)
+			publisher, _ := article["publisher"].(string)
+			// Yahoo 标题可能有 HTML 实体（&#39; 等），先 unescape
+			cleanTitle := html.UnescapeString(title)
+
+			results = append(results, map[string]any{
+				"industryName":  q,
+				"title":         cleanTitle,
+				"emRatingName":  "",
+				"ratingChange":  -1,
+				"sRatingName":   "",
+				"researcher":    "",
+				"orgSName":      publisher,
+				"publishDate":   publishDate,
+				"infoCode":      "",
+				"infoLink":      link, // 直接的新闻 URL（区别于 东财 PDF code）
+			})
+		}
+	}
+
+	// 批量翻译所有英文标题为简体中文（中文标题保持原样，自动缓存）
+	titles := make([]string, len(results))
+	for i, item := range results {
+		article := item.(map[string]any)
+		titles[i], _ = article["title"].(string)
+	}
+	translated := m.TranslateBatch(titles)
+	for i, item := range results {
+		article := item.(map[string]any)
+		article["originalTitle"] = titles[i] // 保留原文（前端可选展示）
+		article["title"] = translated[i]
+	}
+
+	return results
+}
+
+// industryResearchReportByQType 通用研报拉取，按 qType 区分；keywords 非空时按标题做关键词过滤
+func (m MarketNewsApi) industryResearchReportByQType(industryCode string, days int, qType string, keywords []string) []any {
+	beginDate := time.Now().Add(-time.Duration(days) * 24 * time.Hour).Format("2006-01-02")
+	endDate := time.Now().Format("2006-01-02")
+	if strutil.Trim(industryCode) != "" {
+		beginDate = time.Now().Add(-time.Duration(days) * 365 * time.Hour).Format("2006-01-02")
+	}
+
+	params := map[string]string{
+		"industry":     "*",
+		"industryCode": industryCode,
+		"beginTime":    beginDate,
+		"endTime":      endDate,
+		"pageNo":       "1",
+		"pageSize":     "100",
+		"p":            "1",
+		"pageNum":      "1",
+		"pageNumber":   "1",
+		"qType":        qType,
+	}
+
+	resp, err := SharedHTTPClient.SetTimeout(time.Duration(15)*time.Second).R().
+		SetHeader("Host", "reportapi.eastmoney.com").
+		SetHeader("Origin", "https://data.eastmoney.com").
+		SetHeader("Referer", "https://data.eastmoney.com/report/stock.jshtml").
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0").
+		SetHeader("Content-Type", "application/json").
+		SetQueryParams(params).Get("https://reportapi.eastmoney.com/report/list")
+	if err != nil {
+		return []any{}
+	}
+	respMap := map[string]any{}
+	json.Unmarshal(resp.Body(), &respMap)
+
+	data, ok := respMap["data"].([]any)
+	if !ok || len(data) == 0 {
+		return []any{}
+	}
+
+	// 无关键词 → 直接返回
+	if len(keywords) == 0 {
+		return data
+	}
+
+	// 按标题关键词过滤
+	filtered := []any{}
+	for _, item := range data {
+		report, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		title, _ := report["title"].(string)
+		for _, kw := range keywords {
+			if strings.Contains(title, kw) {
+				filtered = append(filtered, item)
+				break
+			}
+		}
+	}
+	return filtered
+}
+
 func (m MarketNewsApi) IndustryResearchReport(industryCode string, days int) []any {
 	beginDate := time.Now().Add(-time.Duration(days) * 24 * time.Hour).Format("2006-01-02")
 	endDate := time.Now().Format("2006-01-02")
@@ -828,6 +1100,409 @@ func (m MarketNewsApi) StockResearchReport(stockCode string, days int) []any {
 	return respMap["data"].([]any)
 }
 
+// 默认聚合的热门港股（恒生主要成分 + 热门 ADR）
+var defaultHKStocks = []string{
+	"00700", // 腾讯
+	"09988", // 阿里巴巴
+	"01810", // 小米
+	"09618", // 京东
+	"03690", // 美团
+	"02318", // 中国平安
+	"01024", // 快手
+	"00939", // 建设银行
+	"02382", // 舜宇光学
+	"00388", // 香港交易所
+}
+
+// HKStockNotice 拉取新浪港股公司公告
+// stockCode 为空 → 默认并行拉热门 10 只港股，按时间排序混合展示
+// 非空 → 按该单只股票拉
+func (m MarketNewsApi) HKStockNotice(stockCode string) []any {
+	stockCode = strings.TrimSpace(stockCode)
+
+	// 空值 → 聚合默认热门股
+	if stockCode == "" {
+		return m.hkStockNoticeBatch(defaultHKStocks)
+	}
+
+	return m.fetchHKStockNotice(stockCode)
+}
+
+// hkStockNoticeBatch 并行抓多只港股公告，按时间排序合并
+func (m MarketNewsApi) hkStockNoticeBatch(codes []string) []any {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	allResults := []any{}
+
+	for _, c := range codes {
+		wg.Add(1)
+		go func(code string) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					logger.SugaredLogger.Warnf("hkStockNoticeBatch panic on %s: %v", code, r)
+				}
+			}()
+			r := m.fetchHKStockNotice(code)
+			mu.Lock()
+			allResults = append(allResults, r...)
+			mu.Unlock()
+		}(c)
+	}
+	wg.Wait()
+
+	// 按 display_time 降序排
+	sort.SliceStable(allResults, func(i, j int) bool {
+		mi, _ := allResults[i].(map[string]any)
+		mj, _ := allResults[j].(map[string]any)
+		ti, _ := mi["display_time"].(string)
+		tj, _ := mj["display_time"].(string)
+		return ti > tj
+	})
+
+	// 最多 80 条
+	if len(allResults) > 80 {
+		allResults = allResults[:80]
+	}
+	return allResults
+}
+
+// fetchHKStockNotice 抓单只港股的公告
+func (m MarketNewsApi) fetchHKStockNotice(stockCode string) []any {
+	results := []any{}
+	stockCode = strings.ToUpper(strings.TrimSpace(stockCode))
+	// 兼容 "00700.HK" / "HK00700" / "00700" / "700"
+	stockCode = strings.TrimSuffix(stockCode, ".HK")
+	stockCode = strings.TrimPrefix(stockCode, "HK")
+	for len(stockCode) < 5 && len(stockCode) > 0 {
+		stockCode = "0" + stockCode
+	}
+	if stockCode == "" {
+		return results
+	}
+
+	pageUrl := fmt.Sprintf("https://stock.finance.sina.com.cn/hkstock/notice/%s.html", stockCode)
+	resp, err := SharedHTTPClient.SetTimeout(time.Duration(15)*time.Second).R().
+		SetHeader("Referer", "https://stock.finance.sina.com.cn/hkstock/").
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/117.0.0.0").
+		Get(pageUrl)
+	if err != nil {
+		logger.SugaredLogger.Errorf("HKStockNotice fetch %s err: %v", stockCode, err)
+		return results
+	}
+
+	// 新浪是 GB18030，自动检测+解码
+	utf8Reader, err := charset.NewReader(bytes.NewReader(resp.Body()), resp.Header().Get("Content-Type"))
+	if err != nil {
+		logger.SugaredLogger.Errorf("HKStockNotice charset %s err: %v", stockCode, err)
+		return results
+	}
+	doc, err := goquery.NewDocumentFromReader(utf8Reader)
+	if err != nil {
+		logger.SugaredLogger.Errorf("HKStockNotice parse %s err: %v", stockCode, err)
+		return results
+	}
+
+	// 从 title 提取公司名 - "腾讯控股(00700)公告_港股频道..."
+	pageTitle := doc.Find("title").Text()
+	companyName := stockCode
+	if m := regexp.MustCompile(`^([^()（）_]+?)\s*[\(（]`).FindStringSubmatch(pageTitle); len(m) > 1 {
+		companyName = strings.TrimSpace(m[1])
+	}
+
+	dateRe := regexp.MustCompile(`(\d{4}-\d{2}-\d{2})`)
+	seen := map[string]bool{}
+
+	doc.Find("a[href*='CompanyNoticeDetail']").Each(func(_ int, s *goquery.Selection) {
+		href, _ := s.Attr("href")
+		if href == "" {
+			return
+		}
+		announceTitle := strings.TrimSpace(s.Text())
+		if announceTitle == "" || len([]rune(announceTitle)) < 5 {
+			return
+		}
+		if seen[announceTitle] {
+			return
+		}
+		seen[announceTitle] = true
+
+		// 找日期 - 通常在 a 的同级或 parent 的 sibling
+		var dateStr string
+		// 1) 看 a 的 parent 节点的 text 是否含日期
+		if parent := s.Parent(); parent != nil {
+			parentText := parent.Text()
+			if m := dateRe.FindString(parentText); m != "" {
+				dateStr = m
+			}
+		}
+		// 2) 看 a 的 next sibling
+		if dateStr == "" {
+			if next := s.Next(); next != nil {
+				if m := dateRe.FindString(next.Text()); m != "" {
+					dateStr = m
+				}
+			}
+		}
+
+		var dataTime time.Time
+		if dateStr != "" {
+			if t, e := time.ParseInLocation("2006-01-02", dateStr, time.Local); e == nil {
+				dataTime = t
+			}
+		}
+		if dataTime.IsZero() {
+			dataTime = time.Now()
+		}
+
+		results = append(results, map[string]any{
+			"codes": []map[string]any{
+				{
+					"stock_code":  stockCode,
+					"short_name":  companyName,
+					"market_code": "hk",
+					"ann_type":    "HK",
+				},
+			},
+			"title": announceTitle,
+			"columns": []map[string]any{
+				{"column_name": "港股公告"},
+			},
+			"notice_date":  dataTime.Format("2006-01-02 15:04:05"),
+			"display_time": dataTime.Format("2006-01-02 15:04:05"),
+			"art_code":     "",
+			"infoLink":     href,
+		})
+	})
+
+	return results
+}
+
+// USStockNotice 拉取 SEC EDGAR 美股公告流（默认拉 8-K 重大事件 + 10-K 年报 + 10-Q 季报 + 6-K 外国公司）
+// tickerFilter: 留空 = 全市场最新；填字符串 = 按公司名/CIK 简单包含过滤
+func (m MarketNewsApi) USStockNotice(tickerFilter string) []any {
+	results := []any{}
+	seen := map[string]bool{}
+
+	// SEC 要求 User-Agent 带联系方式
+	secHeaders := map[string]string{
+		"User-Agent": "go-stock-research contact@go-stock.local",
+		"Accept":     "application/atom+xml, application/xml",
+	}
+
+	formTypes := []string{"8-K", "10-K", "10-Q", "6-K"}
+
+	type atomLink struct {
+		Href string `xml:"href,attr"`
+	}
+	type atomEntry struct {
+		Title   string   `xml:"title"`
+		Link    atomLink `xml:"link"`
+		Updated string   `xml:"updated"`
+		Summary string   `xml:"summary"`
+	}
+	type atomFeed struct {
+		Entries []atomEntry `xml:"entry"`
+	}
+
+	titleRe := regexp.MustCompile(`^([\w\-/]+)\s*-\s*(.+?)\s*\((\d+)\)`)
+
+	for _, formType := range formTypes {
+		apiUrl := fmt.Sprintf("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=%s&company=&dateb=&owner=include&count=30&output=atom",
+			url.QueryEscape(formType))
+
+		req := SharedHTTPClient.SetTimeout(time.Duration(15)*time.Second).R()
+		for k, v := range secHeaders {
+			req.SetHeader(k, v)
+		}
+		resp, err := req.Get(apiUrl)
+		if err != nil {
+			logger.SugaredLogger.Warnf("USStockNotice fetch %s err: %v", formType, err)
+			continue
+		}
+
+		var feed atomFeed
+		// SEC 的 atom 声明 ISO-8859-1，必须设 CharsetReader 让 xml 解码器认得
+		decoder := xml.NewDecoder(bytes.NewReader(resp.Body()))
+		decoder.CharsetReader = charset.NewReaderLabel
+		if err := decoder.Decode(&feed); err != nil {
+			logger.SugaredLogger.Warnf("USStockNotice xml parse %s err: %v", formType, err)
+			continue
+		}
+
+		for _, entry := range feed.Entries {
+			// title 格式: "8-K - Xerox Holdings Corp (0001770450) (Issuer)"
+			matches := titleRe.FindStringSubmatch(entry.Title)
+			if len(matches) < 4 {
+				continue
+			}
+			fType := matches[1]
+			company := strings.TrimSpace(matches[2])
+			cik := matches[3]
+
+			key := fType + "|" + cik + "|" + entry.Updated
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			if tickerFilter != "" {
+				tf := strings.ToLower(strings.TrimSpace(tickerFilter))
+				if !strings.Contains(strings.ToLower(company), tf) && !strings.Contains(cik, tf) {
+					continue
+				}
+			}
+
+			// 解析 updated 时间（RFC3339 带时区）
+			var updatedTime time.Time
+			if t, e := time.Parse(time.RFC3339, entry.Updated); e == nil {
+				updatedTime = t
+			} else {
+				updatedTime = time.Now()
+			}
+
+			// 解析 + 翻译 SEC summary
+			filed, _, sizeStr, items := translateSECSummary(entry.Summary)
+
+			// 构造干净的中文标题
+			var displayTitle string
+			if items != "" {
+				displayTitle = items
+			} else {
+				// 没有 Item 列表（10-K/10-Q/6-K 这类一般不带），就显示申报信息
+				parts := []string{}
+				if filed != "" {
+					parts = append(parts, "申报日期 "+filed)
+				}
+				if sizeStr != "" {
+					parts = append(parts, "大小 "+sizeStr)
+				}
+				if len(parts) > 0 {
+					displayTitle = strings.Join(parts, " · ")
+				} else {
+					displayTitle = formTypeDescription(fType)
+				}
+			}
+
+			// 构造前端期望的 schema（兼容 A股 公告 UI）
+			results = append(results, map[string]any{
+				"codes": []map[string]any{
+					{
+						"stock_code":  cik,
+						"short_name":  company,
+						"market_code": "us",
+						"ann_type":    fType,
+					},
+				},
+				"title": displayTitle,
+				"columns": []map[string]any{
+					{"column_name": formTypeDescription(fType)},
+				},
+				"notice_date":  updatedTime.Local().Format("2006-01-02 15:04:05"),
+				"display_time": updatedTime.Local().Format("2006-01-02 15:04:05"),
+				"art_code":     "",
+				"infoLink":     entry.Link.Href, // SEC EDGAR filing 页面，直接打开
+			})
+		}
+	}
+	return results
+}
+
+// SEC 8-K Item 代码翻译字典（标准的，所有公司都用这套）
+var secItemTranslations = map[string]string{
+	"1.01": "签订重大约束性协议",
+	"1.02": "终止重大约束性协议",
+	"1.03": "破产或接管",
+	"1.04": "采矿事故披露",
+	"2.01": "完成收购或处置",
+	"2.02": "经营业绩与财务状况",
+	"2.03": "产生直接财务义务",
+	"2.04": "触发条件加速/增加直接财务义务",
+	"2.05": "退出或处置相关成本",
+	"2.06": "重大资产减值",
+	"3.01": "退市通知",
+	"3.02": "未注册股权出售",
+	"3.03": "重大修改证券持有人权利",
+	"4.01": "审计师变更",
+	"4.02": "不再依赖之前发布的财务报表",
+	"5.01": "公司控制权变更",
+	"5.02": "董事或高管离任/任命",
+	"5.03": "修改公司章程或细则",
+	"5.04": "临时暂停员工股票交易",
+	"5.05": "修改公司道德规范",
+	"5.07": "提交事项至证券持有人表决",
+	"5.08": "股东董事提名",
+	"6.01": "ABS 信息材料",
+	"7.01": "公平披露规则披露",
+	"8.01": "其他重大事件",
+	"9.01": "财务报表及附件",
+}
+
+// translateSECSummary 解析 SEC summary 字段，提取关键信息并翻译
+// 返回：(申报日期, 申报编号, 文件大小, 翻译后的 Item 列表)
+func translateSECSummary(summary string) (filed, accNo, size, items string) {
+	// 去 HTML 实体
+	summary = html.UnescapeString(summary)
+
+	filedRe := regexp.MustCompile(`Filed:\s*</?b>\s*([\d-]+)`)
+	accNoRe := regexp.MustCompile(`AccNo:\s*</?b>\s*([\d-]+)`)
+	sizeRe := regexp.MustCompile(`Size:\s*</?b>\s*([\d.]+\s*[KMG]?B)`)
+	// 兼容 "Item 7.01: Regulation FD Disclosure" 这种格式（可能跟 <br>、</b>、< 等结束）
+	itemRe := regexp.MustCompile(`Item\s+(\d+\.\d+):\s*([^<]+?)\s*(?:<|$)`)
+
+	if m := filedRe.FindStringSubmatch(summary); len(m) > 1 {
+		filed = m[1]
+	}
+	if m := accNoRe.FindStringSubmatch(summary); len(m) > 1 {
+		accNo = m[1]
+	}
+	if m := sizeRe.FindStringSubmatch(summary); len(m) > 1 {
+		size = m[1]
+	}
+
+	var itemTexts []string
+	seenItems := map[string]bool{}
+	for _, m := range itemRe.FindAllStringSubmatch(summary, -1) {
+		itemNum := m[1]
+		if seenItems[itemNum] {
+			continue
+		}
+		seenItems[itemNum] = true
+		if cn, ok := secItemTranslations[itemNum]; ok {
+			itemTexts = append(itemTexts, "Item "+itemNum+" "+cn)
+		} else {
+			// 未知 item 保留英文原文
+			itemTexts = append(itemTexts, "Item "+itemNum+" "+strings.TrimSpace(m[2]))
+		}
+	}
+	items = strings.Join(itemTexts, " · ")
+	return
+}
+
+// formTypeDescription 把 SEC form type 翻译成中文说明
+func formTypeDescription(formType string) string {
+	switch formType {
+	case "8-K":
+		return "8-K 重大事件"
+	case "10-K":
+		return "10-K 年报"
+	case "10-Q":
+		return "10-Q 季报"
+	case "6-K":
+		return "6-K 外国公司报告"
+	case "20-F":
+		return "20-F 外国年报"
+	case "DEF 14A":
+		return "DEF 14A 委托书"
+	case "S-1":
+		return "S-1 招股说明书"
+	case "4":
+		return "4 内部人交易"
+	default:
+		return formType + " 公告"
+	}
+}
+
 func (m MarketNewsApi) StockNotice(stock_list string) []any {
 	var stockCodes []string
 	for _, stockCode := range strings.Split(stock_list, ",") {
@@ -891,6 +1566,258 @@ func (m MarketNewsApi) EMDictCode(code string, cache *freecache.Cache) []any {
 	//logger.SugaredLogger.Infof("resp:%+v", respMap["data"])
 	cache.Set([]byte(code), resp.Body(), 60*60*24)
 	return respMap["data"].([]any)
+}
+
+// TradingViewNewsByMarket 通用 TradingView 拉取，按市场过滤
+// market: "HK" 港股, "US" 美股, "WLD" 全球
+// source: 写入数据库的 source 字段名，便于按市场区分
+func (m MarketNewsApi) TradingViewNewsByMarket(market, source string) *[]models.Telegraph {
+	client := SharedHTTPClient
+	config := GetSettingConfig()
+	if config.HttpProxyEnabled && config.HttpProxy != "" {
+		client.SetProxy(config.HttpProxy)
+	}
+	TVNews := &[]models.TVNews{}
+	news := &[]models.Telegraph{}
+	url := fmt.Sprintf("https://news-mediator.tradingview.com/news-flow/v2/news?filter=lang%%3Azh-Hans&filter=market_country%%3A%s&client=screener&streaming=false", market)
+
+	resp, err := client.SetTimeout(time.Duration(15)*time.Second).R().
+		SetHeader("Host", "news-mediator.tradingview.com").
+		SetHeader("Origin", "https://cn.tradingview.com").
+		SetHeader("Referer", "https://cn.tradingview.com/").
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0").
+		Get(url)
+	if err != nil {
+		return news
+	}
+	respMap := map[string]any{}
+	if err := json.Unmarshal(resp.Body(), &respMap); err != nil {
+		return news
+	}
+	items, err := json.Marshal(respMap["items"])
+	if err != nil {
+		return news
+	}
+	json.Unmarshal(items, TVNews)
+
+	for i, a := range *TVNews {
+		if i > 15 {
+			break
+		}
+		detail := NewMarketNewsApi().TradingViewNewsDetail(a.Id)
+		dataTime := time.Unix(int64(a.Published), 0).Local()
+		description := ""
+		sentimentResult := ""
+		if detail != nil {
+			description = detail.ShortDescription
+			sentimentResult = AnalyzeSentiment(description).Description
+		}
+		if a.Title == "" {
+			continue
+		}
+		telegraph := &models.Telegraph{
+			Title:           a.Title,
+			Content:         description,
+			DataTime:        &dataTime,
+			IsRed:           false,
+			Time:            dataTime.Format("15:04:05"),
+			Source:          source,
+			Url:             fmt.Sprintf("https://cn.tradingview.com/news/%s", a.Id),
+			SentimentResult: sentimentResult,
+		}
+		cnt := int64(0)
+		if telegraph.Title == "" {
+			db.Dao.Model(telegraph).Where("content=? and source=?", telegraph.Content, source).Count(&cnt)
+		} else {
+			db.Dao.Model(telegraph).Where("title=? and source=?", telegraph.Title, source).Count(&cnt)
+		}
+		if cnt > 0 {
+			continue
+		}
+		db.Dao.Model(&models.Telegraph{}).Where("time=? and title=? and source=?", telegraph.Time, telegraph.Title, source).FirstOrCreate(&telegraph)
+		*news = append(*news, *telegraph)
+	}
+	return news
+}
+
+// EastmoneyHKUSNews 拉取东方财富港股/美股资讯
+// column: "104" 港股资讯 / "105" 美股资讯
+// source: 写库 source 字段名
+func (m MarketNewsApi) EastmoneyHKUSNews(column, source string) *[]models.Telegraph {
+	news := &[]models.Telegraph{}
+	url := fmt.Sprintf("https://newsapi.eastmoney.com/kuaixun/v2/api/list?column=%s&pageindex=1&pagesize=30&_=%d", column, time.Now().UnixMilli())
+	resp, err := SharedHTTPClient.SetTimeout(time.Duration(15)*time.Second).R().
+		SetHeader("Host", "newsapi.eastmoney.com").
+		SetHeader("Referer", "https://kuaixun.eastmoney.com/").
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 Edg/117.0.2045.60").
+		Get(url)
+	if err != nil {
+		logger.SugaredLogger.Errorf("EastmoneyHKUSNews err: %v", err)
+		return news
+	}
+	body := string(resp.Body())
+	// 接口可能返回 JSONP（callback(...)）或纯 JSON，统一处理
+	if idx := strings.Index(body, "("); idx >= 0 && strings.HasSuffix(strings.TrimSpace(body), ")") {
+		body = body[idx+1 : len(body)-1]
+	}
+	parsed := gjson.Parse(body)
+	items := parsed.Get("LivesList")
+	if !items.Exists() {
+		items = parsed.Get("data")
+	}
+	if !items.Exists() || !items.IsArray() {
+		return news
+	}
+	items.ForEach(func(_, v gjson.Result) bool {
+		title := v.Get("title").String()
+		if title == "" {
+			title = v.Get("digest").String()
+		}
+		content := v.Get("digest").String()
+		if content == "" {
+			content = title
+		}
+		showTime := v.Get("showtime").String()
+		if showTime == "" {
+			showTime = v.Get("ctime").String()
+		}
+		var dataTime time.Time
+		if t, e := time.ParseInLocation("2006-01-02 15:04:05", showTime, time.Local); e == nil {
+			dataTime = t
+		} else {
+			dataTime = time.Now()
+		}
+		shareUrl := v.Get("url_unique").String()
+		if shareUrl == "" {
+			shareUrl = v.Get("url").String()
+		}
+		telegraph := &models.Telegraph{
+			Title:           title,
+			Content:         content,
+			Time:            dataTime.Format("15:04:05"),
+			DataTime:        &dataTime,
+			Url:             shareUrl,
+			Source:          source,
+			IsRed:           false,
+			SentimentResult: AnalyzeSentiment(content).Description,
+		}
+		cnt := int64(0)
+		if telegraph.Title == "" {
+			db.Dao.Model(telegraph).Where("content=? and source=?", telegraph.Content, source).Count(&cnt)
+		} else {
+			db.Dao.Model(telegraph).Where("title=? and source=?", telegraph.Title, source).Count(&cnt)
+		}
+		if cnt > 0 {
+			return true
+		}
+		db.Dao.Model(&models.Telegraph{}).Where("time=? and title=? and source=?", telegraph.Time, telegraph.Title, source).FirstOrCreate(&telegraph)
+		*news = append(*news, *telegraph)
+		return true
+	})
+	return news
+}
+
+// SinaHKUSNews 抓取新浪港股/美股专题页新闻
+// market: "hk" 港股 / "us" 美股
+// source: 写库的 source 字段名（如 "新浪-港股" / "新浪-美股"）
+func (m MarketNewsApi) SinaHKUSNews(market, source string) *[]models.Telegraph {
+	news := &[]models.Telegraph{}
+
+	var pageUrl, pathFilter string
+	switch strings.ToLower(market) {
+	case "hk":
+		pageUrl = "https://finance.sina.com.cn/stock/hkstock/"
+		pathFilter = "/hkstock/"
+	case "us":
+		pageUrl = "https://finance.sina.com.cn/stock/usstock/"
+		pathFilter = "/usstock/"
+	default:
+		return news
+	}
+
+	resp, err := SharedHTTPClient.SetTimeout(15*time.Second).R().
+		SetHeader("Referer", "https://finance.sina.com.cn/").
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36").
+		Get(pageUrl)
+	if err != nil {
+		logger.SugaredLogger.Errorf("SinaHKUSNews fetch %s err: %v", source, err)
+		return news
+	}
+
+	// 新浪是 GB18030 编码，用 charset.NewReader 自动检测 <meta charset> 并转 UTF-8
+	contentType := resp.Header().Get("Content-Type")
+	utf8Reader, err := charset.NewReader(bytes.NewReader(resp.Body()), contentType)
+	if err != nil {
+		logger.SugaredLogger.Errorf("SinaHKUSNews charset %s err: %v", source, err)
+		return news
+	}
+
+	doc, err := goquery.NewDocumentFromReader(utf8Reader)
+	if err != nil {
+		logger.SugaredLogger.Errorf("SinaHKUSNews parse %s err: %v", source, err)
+		return news
+	}
+
+	seen := map[string]bool{}
+	datePattern := regexp.MustCompile(`(\d{4}-\d{2}-\d{2})`)
+
+	doc.Find("a").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		href, ok := s.Attr("href")
+		if !ok {
+			return true
+		}
+		// 必须是 .shtml 结尾、必须在港股/美股 path 下
+		if !strings.HasSuffix(href, ".shtml") {
+			return true
+		}
+		if !strings.Contains(href, pathFilter) {
+			return true
+		}
+		title := strings.TrimSpace(s.Text())
+		runes := []rune(title)
+		if len(runes) < 6 || len(runes) > 200 {
+			return true
+		}
+		if seen[title] {
+			return true
+		}
+		seen[title] = true
+
+		// 从 URL 提取日期
+		var dataTime time.Time
+		if matches := datePattern.FindStringSubmatch(href); len(matches) > 1 {
+			if t, e := time.ParseInLocation("2006-01-02", matches[1], time.Local); e == nil {
+				dataTime = t
+			}
+		}
+		if dataTime.IsZero() {
+			dataTime = time.Now()
+		}
+
+		telegraph := &models.Telegraph{
+			Title:           title,
+			Content:         title, // 列表页只有标题
+			Time:            dataTime.Format("15:04:05"),
+			DataTime:        &dataTime,
+			Url:             href,
+			Source:          source,
+			IsRed:           false,
+			SentimentResult: AnalyzeSentiment(title).Description,
+		}
+		cnt := int64(0)
+		db.Dao.Model(telegraph).Where("title=? and source=?", telegraph.Title, source).Count(&cnt)
+		if cnt > 0 {
+			return true
+		}
+		db.Dao.Model(&models.Telegraph{}).Where("time=? and title=? and source=?", telegraph.Time, telegraph.Title, source).FirstOrCreate(&telegraph)
+		*news = append(*news, *telegraph)
+		if len(*news) >= 30 {
+			return false
+		}
+		return true
+	})
+
+	return news
 }
 
 func (m MarketNewsApi) TradingViewNews() *[]models.Telegraph {
@@ -1405,6 +2332,35 @@ func (m MarketNewsApi) CailianpressWeb(searchWords string) *models.CailianpressW
 	logger.SugaredLogger.Debug(res)
 
 	return res
+}
+
+// GetNews24HoursListBySources 按 source 列表（多源）过滤近24小时新闻
+func (m MarketNewsApi) GetNews24HoursListBySources(sources []string, limit int) *[]*models.Telegraph {
+	news := &[]*models.Telegraph{}
+	if len(sources) == 0 {
+		return news
+	}
+	db.Dao.Model(news).Preload("TelegraphTags").
+		Where("source IN ? AND created_at > ?", sources, time.Now().Add(-24*time.Hour)).
+		Order("data_time desc, is_red desc").
+		Limit(limit).
+		Find(news)
+
+	// 内容去重
+	uniqueNews := make([]*models.Telegraph, 0, len(*news))
+	seen := make(map[string]bool)
+	for _, item := range *news {
+		key := item.Content
+		if key == "" {
+			key = item.Title
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		uniqueNews = append(uniqueNews, item)
+	}
+	return &uniqueNews
 }
 
 func (m MarketNewsApi) GetNews24HoursList(source string, limit int) *[]*models.Telegraph {

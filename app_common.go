@@ -49,8 +49,75 @@ func (a *App) StockNotice(stockCode string) []any {
 	return data.NewMarketNewsApi().StockNotice(stockCode)
 }
 
+// USStockNotice 美股公司公告 - SEC EDGAR 数据源
+func (a *App) USStockNotice(tickerFilter string) []any {
+	return data.NewMarketNewsApi().USStockNotice(tickerFilter)
+}
+
+// HKStockNotice 港股公司公告 - 新浪港股数据源（按个股代码查）
+func (a *App) HKStockNotice(stockCode string) []any {
+	return data.NewMarketNewsApi().HKStockNotice(stockCode)
+}
+
+// AnalyzeUplimitWithAI 涨停梯队 AI 一键复盘
+// date: 日期 "2026-05-27"，留空则用今天；aiConfigID: AI 配置 ID，0 表示用第一个
+func (a *App) AnalyzeUplimitWithAI(date string, aiConfigID int) (map[string]any, error) {
+	return data.AnalyzeUplimitWithAI(date, aiConfigID)
+}
+
+// GetUplimitAISummaries 获取最近 N 条涨停梯队 AI 复盘历史
+func (a *App) GetUplimitAISummaries(limit int) []data.UplimitAISummary {
+	return data.GetUplimitAISummaries(limit)
+}
+
+// GetUplimitAISummaryDetail 按 ID 获取某条复盘的完整数据（含推荐列表，用于重新展示弹窗）
+func (a *App) GetUplimitAISummaryDetail(id int) (map[string]any, error) {
+	return data.GetUplimitAISummaryDetail(uint(id))
+}
+
+// DeleteUplimitAISummary 删除某条复盘
+func (a *App) DeleteUplimitAISummary(id int) error {
+	return data.DeleteUplimitAISummary(uint(id))
+}
+
+// SendTestTelegramMessage 通知设置里"发送测试通知"按钮调用：用传入的 token/chatId 发一条测试消息
+// 不依赖 Settings 已保存的值，方便用户在保存前就能验证 token 是否有效
+func (a *App) SendTestTelegramMessage(token, chatId string, useProxy bool) string {
+	text := "*🤖 go-stock Telegram 推送测试* ✅\n\n如果你看到这条消息，说明 Bot Token、Chat ID 和网络代理都已配置正确。\n\n_推送时间: " + FormatShanghaiTime(time.Now()) + "_"
+	if err := data.SendTelegramMessageTo(token, chatId, text, useProxy); err != nil {
+		return "发送失败: " + err.Error()
+	}
+	return "发送成功！请在 Telegram 中查看消息。"
+}
+
+// TriggerTGDailyPush 立即触发一次 TG 推送（mode: morning / afternoon），用于"立即测试推送"按钮
+func (a *App) TriggerTGDailyPush(mode string) string {
+	if mode == "" {
+		mode = "afternoon"
+	}
+	pushMode := data.TGModeAfternoon
+	if mode == "morning" {
+		pushMode = data.TGModeMorning
+	}
+	log, err := data.RunTGDailyPush(a.ctx, pushMode)
+	if err != nil {
+		return "推送失败: " + err.Error() + "\n\n" + log
+	}
+	return "推送成功！\n\n" + log
+}
+
 func (a *App) IndustryResearchReport(industryCode string) []any {
 	return data.NewMarketNewsApi().IndustryResearchReport(industryCode, 7)
+}
+
+// HKIndustryResearchReport 港股相关行业研报
+func (a *App) HKIndustryResearchReport(industryCode string) []any {
+	return data.NewMarketNewsApi().HKIndustryResearchReport(industryCode, 14)
+}
+
+// USIndustryResearchReport 美股相关行业研报
+func (a *App) USIndustryResearchReport(industryCode string) []any {
+	return data.NewMarketNewsApi().USIndustryResearchReport(industryCode, 14)
 }
 func (a *App) EMDictCode(code string) []any {
 	return data.NewMarketNewsApi().EMDictCode(code, a.cache)
@@ -236,6 +303,16 @@ func (a *App) AbortChatWithAgent() {
 
 func (a *App) AnalyzeSentimentWithFreqWeight(text string) map[string]any {
 	result, cleanFrequencies := data.NewsAnalyze(text, false)
+	return map[string]any{
+		"result":      result,
+		"frequencies": cleanFrequencies,
+	}
+}
+
+// AnalyzeSentimentByMarket 按市场（hk/us/a-share）分析近24h热词
+// 用于市场快讯港股/美股 sub-tab 的热词 treemap
+func (a *App) AnalyzeSentimentByMarket(market string) map[string]any {
+	result, cleanFrequencies := data.NewsAnalyzeByMarket(market)
 	return map[string]any{
 		"result":      result,
 		"frequencies": cleanFrequencies,

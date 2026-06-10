@@ -44,6 +44,15 @@ type Settings struct {
 	WindowWidth            int    `json:"windowWidth"`
 	WindowHeight           int    `json:"windowHeight"`
 	PromptPlazaApiBase     string `json:"promptPlazaApiBase" gorm:"column:prompt_plaza_api_base"`
+
+	// Telegram 推送配置（每日定时推送 ai_recommend_stocks 表的当日推荐）
+	TgPushEnable    bool   `json:"tgPushEnable"`                                                    // TG 推送总开关
+	TgBotToken      string `json:"tgBotToken" gorm:"column:tg_bot_token"`                           // BotFather 颁发的 token
+	TgChatId        string `json:"tgChatId" gorm:"column:tg_chat_id"`                               // 接收消息的 chat_id
+	TgAiConfigId    int    `json:"tgAiConfigId" gorm:"column:tg_ai_config_id"`                      // TG 推送跑 AI 推荐时用的 AIConfig ID（0 用第一个）
+	TgSysPromptId   int    `json:"tgSysPromptId" gorm:"column:tg_sys_prompt_id"`                    // 系统提示词模板 ID（从收藏的提示词模板里选）
+	TgUserPrompt    string `json:"tgUserPrompt" gorm:"column:tg_user_prompt;type:text"`             // 用户自定义提问文本（自由输入）
+	TgUseProxy      bool   `json:"tgUseProxy" gorm:"column:tg_use_proxy"`                           // 调用 api.telegram.org 是否走 HttpProxy
 }
 
 func (receiver Settings) TableName() string {
@@ -141,6 +150,13 @@ func UpdateConfig(s *SettingConfig) string {
 			"window_width":               s.WindowWidth,
 			"window_height":              s.WindowHeight,
 			"prompt_plaza_api_base":      s.PromptPlazaApiBase,
+			"tg_push_enable":             s.TgPushEnable,
+			"tg_bot_token":               s.TgBotToken,
+			"tg_chat_id":                 s.TgChatId,
+			"tg_ai_config_id":            s.TgAiConfigId,
+			"tg_sys_prompt_id":           s.TgSysPromptId,
+			"tg_user_prompt":             s.TgUserPrompt,
+			"tg_use_proxy":               s.TgUseProxy,
 		})
 		if result.Error != nil {
 			logger.SugaredLogger.Errorf("更新配置失败: %v", result.Error)

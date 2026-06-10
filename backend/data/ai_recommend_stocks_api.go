@@ -4,12 +4,26 @@ package data
 import (
 	"go-stock/backend/db"
 	"go-stock/backend/models"
+	"strings"
 	"time"
 
 	"github.com/duke-git/lancet/v2/datetime"
 	"github.com/duke-git/lancet/v2/slice"
 	"github.com/duke-git/lancet/v2/strutil"
 )
+
+// normalizeStockCodeForMatch 把各种格式的股票代码统一成同一个 key，方便匹配
+// "us.NVDA" / "usnvda" / "gb_nvda" → "usnvda"（美股）
+// "00700.HK" / "hk00700" → "hk00700"（港股）
+// "603663.SH" / "sh603663" → "sh603663"（A 股）
+func normalizeStockCodeForMatch(code string) string {
+	code = ConvertTushareCodeToStockCode(code) // 现有规范化
+	// 美股 Sina 返回的是 gb_xxx 格式，转换成 usxxx 与数据库 us.XXX 对齐
+	if strings.HasPrefix(code, "gb_") {
+		return "us" + strings.TrimPrefix(code, "gb_")
+	}
+	return code
+}
 
 type AiRecommendStocksService struct{}
 
@@ -120,8 +134,10 @@ func (s *AiRecommendStocksService) GetAiRecommendStocksList(query *models.AiReco
 	})
 	stockData, _ := NewStockDataApi().GetStockCodeRealTimeData(stockCodes...)
 	for _, info := range *stockData {
+		// 用 normalize 函数同时处理 A 股/港股/美股的代码格式差异（us.NVDA vs gb_nvda）
+		infoKey := normalizeStockCodeForMatch(info.Code)
 		for idx, item := range list {
-			if ConvertTushareCodeToStockCode(item.StockCode) == ConvertTushareCodeToStockCode(info.Code) {
+			if normalizeStockCodeForMatch(item.StockCode) == infoKey {
 				list[idx].StockCurrentPrice = info.Price
 				list[idx].StockPrePrice = info.PreClose
 				list[idx].StockCurrentPriceTime = info.Date + " " + info.Time

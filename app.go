@@ -93,7 +93,18 @@ func (a *App) removeCronEntry(key string) {
 }
 
 func (a *App) GetSponsorInfo() map[string]any {
-	return a.SponsorInfo
+	// VIP_BYPASS: 自用版强制返回 VIP2 信息（不论是否有真实赞助码）
+	info := map[string]any{}
+	if a.SponsorInfo != nil {
+		for k, v := range a.SponsorInfo {
+			info[k] = v
+		}
+	}
+	info["vipLevel"] = "2"
+	info["vipStartTime"] = "2020-01-01 00:00:00"
+	info["vipEndTime"] = "2099-12-31 23:59:59"
+	info["vipAuthTime"] = "2020-01-01 00:00:00"
+	return info
 }
 
 // GetEffectiveSponsorVip 从本地配置解密赞助信息并判断当前是否在 VIP 有效期内（与 ai-assistant-web / data.EffectiveSponsorVipLevel 一致）。
@@ -2314,6 +2325,24 @@ func (a *App) ReFleshTelegraphList(source string) *[]*models.Telegraph {
 	return telegraphs
 }
 
+// ReFleshTelegraphListHK 刷新港股市场快讯
+// 3 个独立数据源：华尔街见闻港股 / TradingView 港股 / 新浪港股
+func (a *App) ReFleshTelegraphListHK(source string) *[]*models.Telegraph {
+	go data.NewWallstreetcnApi().GetLivesAsTelegraph("hk-stock-channel", 30)
+	go data.NewMarketNewsApi().TradingViewNewsByMarket("HK", "TradingView-港股")
+	go data.NewMarketNewsApi().SinaHKUSNews("hk", "新浪-港股")
+	return data.NewMarketNewsApi().GetTelegraphList(source)
+}
+
+// ReFleshTelegraphListUS 刷新美股市场快讯
+// 3 个独立数据源：华尔街见闻美股 / TradingView 美股 / 新浪美股
+func (a *App) ReFleshTelegraphListUS(source string) *[]*models.Telegraph {
+	go data.NewWallstreetcnApi().GetLivesAsTelegraph("us-stock-channel", 30)
+	go data.NewMarketNewsApi().TradingViewNewsByMarket("US", "TradingView-美股")
+	go data.NewMarketNewsApi().SinaHKUSNews("us", "新浪-美股")
+	return data.NewMarketNewsApi().GetTelegraphList(source)
+}
+
 func (a *App) GlobalStockIndexes() map[string]any {
 	return data.NewMarketNewsApi().GlobalStockIndexes(30)
 }
@@ -2760,6 +2789,38 @@ func (a *App) InitCronTasks() {
 			logger.SugaredLogger.Info("已自动创建异动数据保存定时任务")
 		}
 	}
+	// TG 每日推送：9:00 盘前回顾 + 14:30 盘中复盘（仅工作日，按交易日历近似）
+	if !cronApi.ExistsByTaskType("tg_daily_push") {
+		morning := &models.CronTask{
+			Name:        "TG盘前回顾推送(9:00)",
+			CronExpr:    "0 0 9 * * 1-5",
+			TaskType:    "tg_daily_push",
+			Params:      `{"mode": "morning"}`,
+			Enable:      true,
+			Status:      "active",
+			Description: "每个工作日 9:00 把前一交易日 14:30 后的 AI 推荐对比最新价，推 Telegram",
+		}
+		if err := cronApi.Create(morning); err != nil {
+			logger.SugaredLogger.Errorf("创建 TG 盘前推送任务失败：%v", err)
+		} else {
+			logger.SugaredLogger.Info("已自动创建 TG 盘前推送定时任务（9:00 工作日）")
+		}
+		afternoon := &models.CronTask{
+			Name:        "TG盘中复盘推送(14:30)",
+			CronExpr:    "0 30 14 * * 1-5",
+			TaskType:    "tg_daily_push",
+			Params:      `{"mode": "afternoon"}`,
+			Enable:      true,
+			Status:      "active",
+			Description: "每个工作日 14:30 跑 AI 短线选股 + 涨停梯队复盘，把当日推荐和摘要推 Telegram",
+		}
+		if err := cronApi.Create(afternoon); err != nil {
+			logger.SugaredLogger.Errorf("创建 TG 盘中推送任务失败：%v", err)
+		} else {
+			logger.SugaredLogger.Info("已自动创建 TG 盘中推送定时任务（14:30 工作日）")
+		}
+	}
+
 	tasks := cronApi.GetAll()
 	if len(tasks) == 0 {
 		return

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	assistantweb "go-stock/ai-assistant-web"
+	"go-stock/backend/agent"
 	"go-stock/backend/data"
 	"go-stock/backend/db"
 	log "go-stock/backend/logger"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/schema"
 	"github.com/duke-git/lancet/v2/convertor"
 	"github.com/duke-git/lancet/v2/slice"
 	"github.com/wailsapp/wails/v2"
@@ -79,6 +81,12 @@ func main() {
 	db.Init("")
 	data.InitAnalyzeSentiment()
 	go AutoMigrate()
+
+	// 把跑 AI agent 的实现注入 data 包，供 tg_daily_push.go 编排"14:30 AI 推荐"使用
+	// （data 不能直接 import agent，会循环引用）
+	data.SetAgentChatRunner(func(c context.Context, q string, aiConfigId int, sysPromptId *int) <-chan *schema.Message {
+		return agent.NewStockAiAgentApi().ChatWithContext(c, q, aiConfigId, sysPromptId, false, 0, false, "")
+	})
 
 	//db.Dao.Model(&data.Group{}).Where("id = ?", 0).FirstOrCreate(&data.Group{
 	//	Name: "默认分组",

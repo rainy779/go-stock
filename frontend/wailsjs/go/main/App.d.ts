@@ -26,7 +26,11 @@ export function AddTradingRecord(arg1:data.TradingRecord):Promise<number>;
 
 export function AnalyzeSentiment(arg1:string):Promise<models.SentimentResult>;
 
+export function AnalyzeSentimentByMarket(arg1:string):Promise<Record<string, any>>;
+
 export function AnalyzeSentimentWithFreqWeight(arg1:string):Promise<Record<string, any>>;
+
+export function AnalyzeUplimitWithAI(arg1:string,arg2:number):Promise<Record<string, any>>;
 
 export function BatchDeleteAIResponseResult(arg1:Array<number>):Promise<string>;
 
@@ -77,6 +81,8 @@ export function DeleteSkill(arg1:number):Promise<string>;
 export function DeleteStockChangeHistory(arg1:number):Promise<string>;
 
 export function DeleteTradingRecord(arg1:number):Promise<void>;
+
+export function DeleteUplimitAISummary(arg1:number):Promise<void>;
 
 export function EMDictCode(arg1:string):Promise<Array<any>>;
 
@@ -252,6 +258,10 @@ export function GetTradingRecordStatistics():Promise<data.TradingRecordStatistic
 
 export function GetTypeStatsByDate(arg1:string):Promise<Array<data.TypeCountStats>>;
 
+export function GetUplimitAISummaries(arg1:number):Promise<Array<data.UplimitAISummary>>;
+
+export function GetUplimitAISummaryDetail(arg1:number):Promise<Record<string, any>>;
+
 export function GetUplimitHot(arg1:string,arg2:number):Promise<Record<string, any>>;
 
 export function GetUserManual():Promise<string>;
@@ -265,6 +275,10 @@ export function GlobalStockIndexes():Promise<Record<string, any>>;
 export function GlobalStockIndexesReadable():Promise<string>;
 
 export function Greet(arg1:string):Promise<data.StockInfo>;
+
+export function HKIndustryResearchReport(arg1:string):Promise<Array<any>>;
+
+export function HKStockNotice(arg1:string):Promise<Array<any>>;
 
 export function HideToTray():Promise<void>;
 
@@ -302,6 +316,10 @@ export function QuitApp():Promise<void>;
 
 export function ReFleshTelegraphList(arg1:string):Promise<any>;
 
+export function ReFleshTelegraphListHK(arg1:string):Promise<any>;
+
+export function ReFleshTelegraphListUS(arg1:string):Promise<any>;
+
 export function RemoveGroup(arg1:number):Promise<string>;
 
 export function RemoveStockGroup(arg1:string,arg2:string,arg3:number):Promise<string>;
@@ -332,6 +350,8 @@ export function SendDingDingMessage(arg1:string,arg2:string):Promise<string>;
 
 export function SendDingDingMessageByType(arg1:string,arg2:string,arg3:number):Promise<string>;
 
+export function SendTestTelegramMessage(arg1:string,arg2:string,arg3:boolean):Promise<string>;
+
 export function SetAlarmChangePercent(arg1:number,arg2:number,arg3:string):Promise<string>;
 
 export function SetCostPriceAndVolume(arg1:string,arg2:number,arg3:number):Promise<string>;
@@ -355,6 +375,12 @@ export function StockResearchReport(arg1:string):Promise<Array<any>>;
 export function SummaryStockNews(arg1:string,arg2:number,arg3:any,arg4:boolean,arg5:boolean,arg6:string,arg7:string):Promise<void>;
 
 export function TestMCPServer(arg1:number):Promise<string>;
+
+export function TriggerTGDailyPush(arg1:string):Promise<string>;
+
+export function USIndustryResearchReport(arg1:string):Promise<Array<any>>;
+
+export function USStockNotice(arg1:string):Promise<Array<any>>;
 
 export function UnFollow(arg1:string):Promise<string>;
 
